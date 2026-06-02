@@ -122,9 +122,9 @@ Every processed request is stored with its SHA-256 fingerprint, status (`PENDING
 
 ---
 
-### Test Suite — 12 Passed
+### Test Suite — 19 Passed
 
-![12 tests passing](docs/screenshots/tests-passing.png)
+![19 tests passing](docs/screenshots/tests-passing.png)
 
 ---
 
@@ -272,7 +272,7 @@ aegis/
 PYTHONPATH=. pytest tests/ -v
 ```
 
-12 tests covering all scenarios, TTL expiry, missing headers, and GET pass-through.
+19 tests covering all scenarios, TTL expiry, missing headers, and GET pass-through.
 
 ---
 
