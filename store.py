@@ -6,21 +6,20 @@
 # A blocking sqlite3 call inside an async function freezes the entire event
 # loop — all in-flight requests stall until that call completes.
 
-import json
 import time
 from typing import Optional
 
 import aiosqlite
 
 from config import settings
-from models import IdempotencyRecord, KeyStatus
+from models import IdempotencyRecord, State
 
 # DDL — run once on startup via init_db()
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key             TEXT PRIMARY KEY,
     fingerprint     TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'PENDING',
+    status          TEXT NOT NULL DEFAULT 'in_flight',
     response_status INTEGER,
     response_body   TEXT,
     response_headers TEXT,
@@ -63,7 +62,7 @@ async def get_record(db: aiosqlite.Connection, key: str) -> Optional[Idempotency
     return IdempotencyRecord(
         key=row[0],
         fingerprint=row[1],
-        status=KeyStatus(row[2]),
+        status=State(row[2]),
         response_status=row[3],
         response_body=row[4],
         response_headers=row[5],
@@ -71,19 +70,19 @@ async def get_record(db: aiosqlite.Connection, key: str) -> Optional[Idempotency
     )
 
 
-async def insert_pending(db: aiosqlite.Connection, key: str, fingerprint: str) -> None:
+async def insert_in_flight(db: aiosqlite.Connection, key: str, fingerprint: str) -> None:
     """
-    Insert a new key in PENDING status before forwarding to upstream.
+    Insert a new key in in_flight status before forwarding to upstream.
     The lock in proxy.py is held across the entire upstream call, so
-    no concurrent request ever reads this PENDING state directly —
-    they block on the lock. PENDING exists for crash recovery: if Aegis
+    no concurrent request ever reads this in_flight state directly —
+    they block on the lock. in_flight exists for crash recovery: if Aegis
     dies after this write, the next request finds the orphaned record
     and returns 409. See DECISIONS.md D-004.
     """
     await db.execute(
         """
         INSERT INTO idempotency_keys (key, fingerprint, status, created_at)
-        VALUES (?, ?, 'PENDING', ?)
+        VALUES (?, ?, 'in_flight', ?)
         """,
         (key, fingerprint, time.time()),
     )
@@ -98,13 +97,13 @@ async def update_complete(
     response_headers: str,
 ) -> None:
     """
-    Transition a PENDING record to COMPLETE and store the upstream response.
+    Transition an in_flight record to completed and store the upstream response.
     All subsequent duplicate requests will get this cached response.
     """
     await db.execute(
         """
         UPDATE idempotency_keys
-        SET status           = 'COMPLETE',
+        SET status           = 'completed',
             response_status  = ?,
             response_body    = ?,
             response_headers = ?
@@ -113,6 +112,51 @@ async def update_complete(
         (response_status, response_body, response_headers, key),
     )
     await db.commit()
+
+
+async def update_failed(
+    db: aiosqlite.Connection,
+    key: str,
+    response_status: int,
+    response_body: str,
+    response_headers: str,
+) -> None:
+    """
+    Transition an in_flight record to failed and store the upstream response.
+    Client may retry with the same key — failed records are not cached.
+    """
+    await db.execute(
+        """
+        UPDATE idempotency_keys
+        SET status           = 'failed',
+            response_status  = ?,
+            response_body    = ?,
+            response_headers = ?
+        WHERE key = ?
+        """,
+        (response_status, response_body, response_headers, key),
+    )
+    await db.commit()
+
+
+async def recover_stuck_in_flight(db: aiosqlite.Connection) -> int:
+    """
+    On startup, transition any in_flight record older than 60 seconds to failed.
+    These are records where Aegis crashed mid-request and will never complete.
+    Returns number of records recovered.
+    """
+    cutoff = time.time() - 60
+    cursor = await db.execute(
+        """
+        UPDATE idempotency_keys
+        SET status = 'failed'
+        WHERE status = 'in_flight'
+        AND created_at < ?
+        """,
+        (cutoff,),
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 async def delete_record(db: aiosqlite.Connection, key: str) -> None:
