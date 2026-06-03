@@ -3,10 +3,10 @@
 #
 # Five outcomes:
 #   1. New key          → forward to upstream, cache response if cacheable, return it
-#   2. Cached (COMPLETE, same fingerprint) → return cached response immediately
+#   2. Cached (completed, same fingerprint) → return cached response immediately
 #   3. Mismatched body  → 422 Unprocessable Entity (DECISIONS.md D-006)
-#   4. Orphaned PENDING → 409 Conflict — crash recovery (DECISIONS.md D-007)
-#   5. Upstream failure → delete PENDING, return 502 (key released, safe to retry)
+#   4. Orphaned in_flight → 409 Conflict — crash recovery (DECISIONS.md D-007)
+#   5. Upstream failure → delete in_flight, return 502 (key released, safe to retry)
 
 import json
 
@@ -18,12 +18,13 @@ from config import settings
 from eviction import is_expired
 from fingerprint import compute_fingerprint
 from lock_manager import lock_manager
-from models import KeyStatus
+from models import State
 from store import (
     delete_record,
     get_record,
-    insert_pending,
+    insert_in_flight,
     update_complete,
+    update_failed,
 )
 
 # HTTP/1.1 hop-by-hop headers (RFC 2616 §13.5.1).
@@ -39,8 +40,6 @@ _HOP_BY_HOP = frozenset([
 ])
 
 # Response headers that must NEVER be stored in the DB or replayed from cache.
-# These are safe to return on the first (fresh) response but must not be
-# handed to a future caller who happens to share the same idempotency key.
 # Set-Cookie is the critical one: replaying client A's session cookie to
 # client B is a direct session-leak vulnerability.
 # See DECISIONS.md D-022.
@@ -55,8 +54,6 @@ _DENY_CACHE_HEADERS = frozenset([
 # 408 Request Timeout: transient, not deterministic.
 # 425 Too Early: transient (TLS early data).
 # 429 Too Many Requests: transient — rate limit will reset.
-# Caching principle: only cache responses that are deterministic for the
-# same input. A 400 validation error is deterministic; a 429 is not.
 # See DECISIONS.md D-021.
 _NON_CACHEABLE_STATUS = frozenset(range(500, 600)) | {408, 425, 429}
 
@@ -68,23 +65,23 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
 
     Step-by-step:
     1. Read Idempotency-Key header (400 if missing)
-    2. Read + fingerprint request body (SHA-256)
+    2. Read + fingerprint request body (SHA-256 over method + path + body)
     3. Acquire per-key asyncio.Lock.
        The lock is held for the FULL duration — DB read, upstream call, DB write.
        A concurrent duplicate blocks on the lock and, when A completes, acquires
-       it and finds COMPLETE. It NEVER sees PENDING during normal operation.
+       it and finds completed. It NEVER sees in_flight during normal operation.
     4. Inside the lock:
        a. Look up key in DB
        b. If found but expired → delete, treat as new
-       c. If not found → insert PENDING, forward, handle upstream result
-       d. If PENDING → 409 orphaned key (from previous Aegis crash only)
-       e. If COMPLETE + wrong fingerprint → 422
-       f. If COMPLETE + correct fingerprint → return cached response
+       c. If not found → insert in_flight, forward, handle upstream result
+       d. If in_flight → 409 orphaned key (from previous Aegis crash only)
+       e. If completed + wrong fingerprint → 422
+       f. If completed + correct fingerprint → return cached response
 
     Upstream failure handling:
-    - Connection/timeout exception: delete PENDING, return 502. Key released.
-    - HTTP 5xx or transient 4xx (408/425/429): delete PENDING, pass through. Key released.
-    - HTTP 2xx or deterministic 4xx: cache as COMPLETE.
+    - Connection/timeout exception: delete in_flight, return 502. Key released.
+    - HTTP 5xx or transient 4xx (408/425/429): delete in_flight, pass through. Key released.
+    - HTTP 2xx or deterministic 4xx: cache as completed.
     """
     idempotency_key = request.headers.get("Idempotency-Key")
     if not idempotency_key:
@@ -94,11 +91,11 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
         )
 
     body: bytes = await request.body()
-    fingerprint: str = compute_fingerprint(body)
+    fingerprint: str = compute_fingerprint(request.method, request.url.path, body)
 
     # ── Acquire per-key lock ──────────────────────────────────────────────────
     # Lock is held across the entire upstream call. Concurrent duplicates block
-    # here until the first request completes, then read COMPLETE from the DB.
+    # here until the first request completes, then read completed from the DB.
     # See DECISIONS.md D-004.
     async with lock_manager.get(idempotency_key):
         record = await get_record(db, idempotency_key)
@@ -110,20 +107,18 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
 
         # ── New key: forward to upstream ──────────────────────────────────────
         if record is None:
-            # Write PENDING before calling upstream.
-            # The lock is held across the entire upstream call, so no concurrent
-            # request can read this PENDING state — they block on the lock.
-            # PENDING exists for crash recovery: if Aegis dies between here and
-            # update_complete(), the next request finds the orphaned record
+            # Write in_flight before calling upstream.
+            # in_flight exists for crash recovery: if Aegis dies between here
+            # and update_complete(), the next request finds the orphaned record
             # and returns 409. See DECISIONS.md D-014.
-            await insert_pending(db, idempotency_key, fingerprint)
+            await insert_in_flight(db, idempotency_key, fingerprint)
 
             # ── Call upstream ─────────────────────────────────────────────────
             try:
                 upstream_resp = await forward_to_upstream(request, body)
             except Exception:
                 # Connection error or timeout — upstream unreachable.
-                # Delete PENDING so this key is not permanently bricked.
+                # Delete in_flight so this key is not permanently bricked.
                 await delete_record(db, idempotency_key)
                 return _json_response(
                     {
@@ -133,11 +128,17 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
                     status_code=502,
                 )
 
-            # ── Non-cacheable response: release key, pass through ─────────────
+            # ── Non-cacheable response: mark failed, pass through ─────────────
             # Transient errors must not be cached — the next retry should reach
             # a healthy upstream. See DECISIONS.md D-021.
             if upstream_resp.status_code in _NON_CACHEABLE_STATUS:
-                await delete_record(db, idempotency_key)
+                await update_failed(
+                    db,
+                    idempotency_key,
+                    upstream_resp.status_code,
+                    upstream_resp.text,
+                    json.dumps(_cacheable_headers(upstream_resp.headers)),
+                )
                 return Response(
                     content=upstream_resp.content,
                     status_code=upstream_resp.status_code,
@@ -166,12 +167,12 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
                 headers=_response_headers(upstream_resp.headers),
             )
 
-        # ── Orphaned PENDING: 409 ─────────────────────────────────────────────
+        # ── Orphaned in_flight: 409 ───────────────────────────────────────────
         # This fires ONLY for crash recovery — when a previous Aegis process
-        # died after writing PENDING but before writing COMPLETE.
+        # died after writing in_flight but before writing completed.
         # For normal concurrent duplicates, B blocks on the lock above and
         # never reaches this branch. See DECISIONS.md D-007.
-        if record.status == KeyStatus.PENDING:
+        if record.status == State.in_flight:
             return _json_response(
                 {
                     "error": "This Idempotency-Key has an unresolved in-flight state.",
@@ -191,7 +192,7 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
                 status_code=422,
             )
 
-        # ── Cache hit: COMPLETE + matching fingerprint ────────────────────────
+        # ── Cache hit: completed + matching fingerprint ───────────────────────
         # Stored headers already have Set-Cookie + hop-by-hop stripped.
         cached_headers = (
             json.loads(record.response_headers) if record.response_headers else {}
@@ -207,11 +208,8 @@ async def forward_to_upstream(request: Request, body: bytes) -> httpx.Response:
     """
     Forward the original request to the configured upstream URL.
 
-    Strips:
-    - hop-by-hop headers (RFC 2616 §13.5.1)
-    - Host and Content-Length (httpx sets these automatically)
-    - Idempotency-Key (upstream doesn't need Aegis's routing header)
-
+    Strips hop-by-hop headers, Host, Content-Length, and Idempotency-Key
+    before forwarding. Upstream doesn't need Aegis's routing header.
     Uses settings.upstream_timeout_seconds so timeout is configurable
     via environment variable rather than hardcoded.
     """
@@ -219,8 +217,6 @@ async def forward_to_upstream(request: Request, body: bytes) -> httpx.Response:
     if request.url.query:
         target_url += f"?{request.url.query}"
 
-    # Strip Host, Content-Length, and Idempotency-Key before forwarding.
-    # The upstream service doesn't need or understand our proxy's routing header.
     _strip_forward = {"host", "content-length", "idempotency-key"}
     forward_headers = {
         k: v
@@ -242,7 +238,7 @@ async def forward_to_upstream(request: Request, body: bytes) -> httpx.Response:
 def _response_headers(headers) -> dict:
     """
     Strip hop-by-hop headers from a response before returning to the client.
-    Used for BOTH fresh and non-cacheable responses.
+    Used for both fresh and non-cacheable responses.
     Does NOT strip Set-Cookie — the real first caller should receive it.
     """
     return {
