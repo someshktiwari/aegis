@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, Response
 from config import settings
 from eviction import eviction_loop
 from proxy import forward_to_upstream, handle_request
-from store import init_db
+from store import init_db, recover_stuck_in_flight
 
 
 @asynccontextmanager
@@ -24,6 +24,7 @@ async def lifespan(app: FastAPI):
     Startup:
     - Open a single aiosqlite connection (shared across all requests via app.state)
     - Initialise the DB schema (idempotency_keys table + index)
+    - Recover any in_flight records stuck from a previous crash
     - Start the background eviction task
 
     Shutdown:
@@ -38,6 +39,9 @@ async def lifespan(app: FastAPI):
     """
     db: aiosqlite.Connection = await aiosqlite.connect(settings.db_path)
     await init_db(db)
+    recovered = await recover_stuck_in_flight(db)
+    if recovered:
+        print(f"[Aegis] Recovered {recovered} stuck in_flight record(s) from previous crash.")
     app.state.db = db
 
     eviction_task = asyncio.create_task(eviction_loop(db))
@@ -58,8 +62,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Aegis — Idempotency Proxy Service",
     description=(
-        "A Stripe-style idempotency layer implemented as a FastAPI reverse proxy. "
-        "Guarantees exactly-once semantics for non-idempotent HTTP operations."
+        "A Stripe-style idempotency proxy service. "
+        "Guarantees at-most-once execution for retried HTTP requests."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -72,9 +76,9 @@ async def proxy_all(request: Request):
     Catch-all route: every incoming request passes through this handler.
 
     Routing logic:
-    - Non-GET with Idempotency-Key  → idempotency path (handle_request)
+    - Non-GET with Idempotency-Key    → idempotency path (handle_request)
     - Non-GET without Idempotency-Key → 400 (header required)
-    - GET (with or without key)     → pass-through (GET is idempotent by HTTP semantics)
+    - GET (with or without key)       → pass-through (GET is idempotent by HTTP semantics)
 
     Why GET is always pass-through:
     GET requests have no side effects — calling the same GET twice produces
@@ -90,7 +94,7 @@ async def proxy_all(request: Request):
     if has_key and request.method != "GET":
         return await handle_request(request, request.app.state.db)
 
-    # ── Non-GET without key → 400 ─────────────────────────────────────────────
+    # ── Non-GET without key → 400 ────────────────────────────────────────────
     if request.method != "GET":
         return JSONResponse(
             content={"error": "Idempotency-Key header is required for non-GET requests"},
