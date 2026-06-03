@@ -15,21 +15,26 @@ from config import settings
 from models import IdempotencyRecord, State
 
 # DDL — run once on startup via init_db()
+# expires_at stores the absolute expiry timestamp (created_at + ttl). Storing it
+# per-row lets the eviction sweep do a single indexed comparison and allows
+# different keys to carry different TTLs in future. See DECISIONS.md D-008.
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key             TEXT PRIMARY KEY,
     fingerprint     TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'in_flight',
-    status_code INTEGER,
+    status_code     INTEGER,
     response_body   TEXT,
     response_headers TEXT,
-    created_at      REAL NOT NULL
+    created_at      REAL NOT NULL,
+    expires_at      REAL NOT NULL
 )
 """
 
-# Index to speed up the TTL eviction sweep (DELETE WHERE created_at < cutoff)
+# Index on expires_at — the eviction sweep filters on it every cycle.
+# DELETE FROM idempotency_keys WHERE expires_at < now
 CREATE_INDEX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_created_at ON idempotency_keys (created_at)
+CREATE INDEX IF NOT EXISTS idx_expires_at ON idempotency_keys (expires_at)
 """
 
 
@@ -48,7 +53,8 @@ async def get_record(db: aiosqlite.Connection, key: str) -> Optional[Idempotency
     async with db.execute(
         """
         SELECT key, fingerprint, status,
-               status_code, response_body, response_headers, created_at
+               status_code, response_body, response_headers,
+               created_at, expires_at
         FROM idempotency_keys
         WHERE key = ?
         """,
@@ -67,6 +73,7 @@ async def get_record(db: aiosqlite.Connection, key: str) -> Optional[Idempotency
         response_body=row[4],
         response_headers=row[5],
         created_at=row[6],
+        expires_at=row[7],
     )
 
 
@@ -78,13 +85,17 @@ async def insert_in_flight(db: aiosqlite.Connection, key: str, fingerprint: str)
     they block on the lock. in_flight exists for crash recovery: if Aegis
     dies after this write, the next request finds the orphaned record
     and returns 409. See DECISIONS.md D-004.
+
+    expires_at is set at insert time as created_at + ttl_seconds.
     """
+    now = time.time()
+    expires_at = now + settings.ttl_seconds
     await db.execute(
         """
-        INSERT INTO idempotency_keys (key, fingerprint, status, created_at)
-        VALUES (?, ?, 'in_flight', ?)
+        INSERT INTO idempotency_keys (key, fingerprint, status, created_at, expires_at)
+        VALUES (?, ?, 'in_flight', ?, ?)
         """,
-        (key, fingerprint, time.time()),
+        (key, fingerprint, now, expires_at),
     )
     await db.commit()
 
@@ -104,7 +115,7 @@ async def update_complete(
         """
         UPDATE idempotency_keys
         SET status           = 'completed',
-            status_code  = ?,
+            status_code      = ?,
             response_body    = ?,
             response_headers = ?
         WHERE key = ?
@@ -129,7 +140,7 @@ async def update_failed(
         """
         UPDATE idempotency_keys
         SET status           = 'failed',
-            status_code  = ?,
+            status_code      = ?,
             response_body    = ?,
             response_headers = ?
         WHERE key = ?
@@ -167,13 +178,14 @@ async def delete_record(db: aiosqlite.Connection, key: str) -> None:
 
 async def delete_expired(db: aiosqlite.Connection) -> int:
     """
-    Bulk-delete all rows older than TTL. Called by the background eviction loop.
-    Returns number of rows deleted.
-    See DECISIONS.md D-008 for the combined lazy + eager eviction strategy.
+    Bulk-delete all rows whose expires_at is in the past. Called by the
+    background eviction loop. Returns number of rows deleted.
+    Uses the stored expires_at column (indexed) rather than recomputing
+    created_at + ttl on every sweep. See DECISIONS.md D-008.
     """
-    cutoff = time.time() - settings.ttl_seconds
+    now = time.time()
     cursor = await db.execute(
-        "DELETE FROM idempotency_keys WHERE created_at < ?", (cutoff,)
+        "DELETE FROM idempotency_keys WHERE expires_at < ?", (now,)
     )
     await db.commit()
     return cursor.rowcount

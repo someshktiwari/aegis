@@ -27,6 +27,8 @@ async def test_insert_in_flight_creates_record(db):
     assert record.state == State.in_flight
     assert record.status_code is None
     assert record.response_body is None
+    # expires_at is set at insert time to created_at + ttl, so it is in the future
+    assert record.expires_at > time.time()
 
 
 @pytest.mark.asyncio
@@ -56,10 +58,14 @@ async def test_delete_record_removes_row(db):
 
 @pytest.mark.asyncio
 async def test_delete_expired_removes_old_rows(db):
-    # Insert a record with a timestamp far in the past
+    # Insert a record whose expires_at is in the past — must be evicted.
+    past = time.time() - 999_999
     await db.execute(
-        "INSERT INTO idempotency_keys (key, fingerprint, status, created_at) VALUES (?, ?, 'completed', ?)",
-        ("old-key", "fp-old", time.time() - 999_999),
+        """
+        INSERT INTO idempotency_keys (key, fingerprint, status, created_at, expires_at)
+        VALUES (?, ?, 'completed', ?, ?)
+        """,
+        ("old-key", "fp-old", past, past),
     )
     await db.commit()
 
@@ -70,6 +76,8 @@ async def test_delete_expired_removes_old_rows(db):
 
 @pytest.mark.asyncio
 async def test_delete_expired_preserves_fresh_rows(db):
+    # insert_in_flight sets expires_at to now + ttl (in the future), so the
+    # sweep must NOT delete it.
     await insert_in_flight(db, "fresh-key", "fp-fresh")
     deleted = await delete_expired(db)
     assert deleted == 0

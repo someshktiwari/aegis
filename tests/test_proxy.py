@@ -12,9 +12,7 @@ import pytest
 
 
 def _make_upstream_response(status_code: int = 200, body: dict = None, headers: dict = None):
-    """
-    Build a fake httpx.Response-like object for mocking upstream calls.
-    """
+    """Build a fake httpx.Response-like object for mocking upstream calls."""
     body = body or {"result": "success"}
     mock_resp = MagicMock()
     mock_resp.status_code = status_code
@@ -91,16 +89,21 @@ async def test_missing_idempotency_key_returns_400(client):
 
 @pytest.mark.asyncio
 async def test_expired_key_treated_as_new(client, db):
+    # Insert a completed record whose expires_at is in the past. The proxy's
+    # on-access expiry check must treat it as expired, delete it, and forward fresh.
+    past = time.time() - 999_999
     await db.execute(
         """
         INSERT INTO idempotency_keys
-            (key, fingerprint, status, status_code, response_body, response_headers, created_at)
-        VALUES (?, ?, 'completed', 200, '{"old": true}', '{}', ?)
+            (key, fingerprint, status, status_code, response_body, response_headers,
+             created_at, expires_at)
+        VALUES (?, ?, 'completed', 200, '{"old": true}', '{}', ?, ?)
         """,
         (
             "idem-expired-001",
-            __import__("hashlib").sha256(b'{"amount": 100}').hexdigest(),
-            time.time() - 999_999,
+            __import__("hashlib").sha256(b"POST\n/payments\n" + b'{"amount": 100}').hexdigest(),
+            past,
+            past,
         ),
     )
     await db.commit()
@@ -136,8 +139,7 @@ async def test_get_without_key_passes_through(client):
 async def test_get_with_key_passes_through_without_caching(client):
     """
     GET with an Idempotency-Key must pass through without caching.
-    Before this fix: GET+key entered the idempotency path and was cached for 24h,
-    serving stale data on every subsequent GET with the same key.
+    GET is idempotent by HTTP semantics, so it is never cached even with a key.
     """
     mock_resp = _make_upstream_response(200, {"items": ["a", "b"]})
 
@@ -156,10 +158,8 @@ async def test_get_with_key_passes_through_without_caching(client):
 @pytest.mark.asyncio
 async def test_upstream_connection_error_returns_502_and_releases_key(client, db):
     """
-    When upstream raises a connection error, Aegis must:
-    1. Return 502 (not 500)
-    2. Delete the in_flight row so the client can retry with the same key.
-    Before this fix: in_flight row stayed, every retry got 409 for 24h.
+    On a connection error, Aegis returns 502 and releases the key (deletes the
+    in_flight row) so the client can retry with the same key.
     """
     with patch(
         "proxy.forward_to_upstream",
@@ -218,10 +218,7 @@ async def test_upstream_timeout_releases_key(client, db):
 
 @pytest.mark.asyncio
 async def test_upstream_5xx_is_not_cached(client, db):
-    """
-    A transient upstream 500 must NOT be cached.
-    Before this fix: 500 was cached, every retry got the cached 500 forever.
-    """
+    """A transient upstream 500 must NOT be cached; the retry reaches upstream again."""
     error_resp = _make_upstream_response(500, {"error": "upstream overloaded"})
 
     with patch("proxy.forward_to_upstream", new=AsyncMock(return_value=error_resp)):
@@ -250,12 +247,7 @@ async def test_upstream_5xx_is_not_cached(client, db):
 
 @pytest.mark.asyncio
 async def test_upstream_429_is_not_cached(client, db):
-    """
-    429 Too Many Requests is transient — the rate limit will reset.
-    It must NOT be cached; the retry must reach the upstream after the limit resets.
-    Before this fix: 429 was cached (treated as deterministic 4xx) and the key
-    was permanently bricked for 24h after a single rate-limit blip.
-    """
+    """429 is transient — it must NOT be cached; the retry reaches upstream again."""
     rate_limit_resp = _make_upstream_response(429, {"error": "rate limit exceeded"})
 
     with patch("proxy.forward_to_upstream", new=AsyncMock(return_value=rate_limit_resp)):
@@ -282,9 +274,8 @@ async def test_upstream_429_is_not_cached(client, db):
 @pytest.mark.asyncio
 async def test_upstream_4xx_deterministic_is_cached(client, db):
     """
-    Deterministic client errors (e.g. 400 validation) ARE cached.
-    The same invalid request will always produce the same error — caching it
-    prevents hammering upstream with a request that will never succeed.
+    Deterministic client errors (e.g. 400 validation) ARE cached — the same
+    invalid input always produces the same error, so caching prevents hammering.
     """
     error_resp = _make_upstream_response(400, {"error": "invalid amount"})
 
@@ -313,7 +304,6 @@ async def test_upstream_4xx_deterministic_is_cached(client, db):
 async def test_set_cookie_stripped_from_cached_response(client, db):
     """
     Set-Cookie must NOT be replayed from cache to a future caller.
-    Replaying client A's session cookie to client B is a session-leak vulnerability.
     The first (fresh) response returns Set-Cookie; the cached replay does not.
     """
     resp_with_cookie = _make_upstream_response(

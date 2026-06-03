@@ -92,7 +92,7 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
         record = await get_record(db, idempotency_key)
 
         # Expired record: treat as brand-new key
-        if record is not None and is_expired(record.created_at):
+        if record is not None and is_expired(record.expires_at):
             await delete_record(db, idempotency_key)
             record = None
 

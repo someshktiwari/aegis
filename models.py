@@ -4,8 +4,8 @@
 
 from enum import Enum
 from typing import Optional
+
 from sqlmodel import SQLModel, Field
-from datetime import datetime, timedelta, timezone
 
 
 class State(str, Enum):
@@ -13,7 +13,7 @@ class State(str, Enum):
     Three-state machine for an idempotency record lifecycle.
     in_flight  — request is being forwarded to upstream, not yet resolved
     completed  — upstream responded, cached response is stored
-    failed     — upstream returned 5xx, timed out, or process crashed mid-request
+    failed     — upstream returned 5xx/429, timed out, or process crashed mid-request
     """
     in_flight = "in_flight"
     completed = "completed"
@@ -24,14 +24,17 @@ class IdempotencyRecord(SQLModel, table=True):
     """
     Represents a single idempotency record in the SQLite store.
     One row per unique Idempotency-Key received by the proxy.
+
+    Timestamps are stored as Unix epoch floats (via time.time()) to match the
+    SQLite REAL columns and the float-based comparisons in eviction.py.
+    expires_at is computed once at insert time (created_at + ttl_seconds);
+    the eviction sweep and on-access check both compare against it directly.
     """
     idempotency_key: str = Field(primary_key=True)
-    api_key: str = Field(default=None, nullable=False)
-    fingerprint: str = Field(default=None, nullable=False)
+    fingerprint: str = Field(nullable=False)
     state: State = Field(default=State.in_flight)
     status_code: Optional[int] = Field(default=None)
-    response_headers: Optional[str] = Field(default=None)
     response_body: Optional[str] = Field(default=None)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    expires_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc) + timedelta(hours=24))
+    response_headers: Optional[str] = Field(default=None)
+    created_at: float = Field(nullable=False)
+    expires_at: float = Field(nullable=False)
