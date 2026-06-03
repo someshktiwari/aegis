@@ -40,6 +40,9 @@ async def eviction_loop(db: aiosqlite.Connection) -> None:
     """
     while True:
         await asyncio.sleep(settings.eviction_interval_seconds)
-        deleted = await delete_expired(db)
-        if deleted:
-            print(f"[Aegis eviction] Deleted {deleted} expired idempotency record(s)")
+        try:
+            deleted = await delete_expired(db)
+            if deleted:
+                print(f"[Aegis eviction] Deleted {deleted} expired idempotency record(s)")
+        except Exception as e:
+            print(f"[Aegis eviction] Error during sweep: {e}")
