@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     key             TEXT PRIMARY KEY,
     fingerprint     TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'in_flight',
-    response_status INTEGER,
+    status_code INTEGER,
     response_body   TEXT,
     response_headers TEXT,
     created_at      REAL NOT NULL
@@ -48,7 +48,7 @@ async def get_record(db: aiosqlite.Connection, key: str) -> Optional[Idempotency
     async with db.execute(
         """
         SELECT key, fingerprint, status,
-               response_status, response_body, response_headers, created_at
+               status_code, response_body, response_headers, created_at
         FROM idempotency_keys
         WHERE key = ?
         """,
@@ -60,10 +60,10 @@ async def get_record(db: aiosqlite.Connection, key: str) -> Optional[Idempotency
         return None
 
     return IdempotencyRecord(
-        key=row[0],
+        idempotency_key=row[0],
         fingerprint=row[1],
-        status=State(row[2]),
-        response_status=row[3],
+        state=State(row[2]),
+        status_code=row[3],
         response_body=row[4],
         response_headers=row[5],
         created_at=row[6],
@@ -92,7 +92,7 @@ async def insert_in_flight(db: aiosqlite.Connection, key: str, fingerprint: str)
 async def update_complete(
     db: aiosqlite.Connection,
     key: str,
-    response_status: int,
+    status_code: int,
     response_body: str,
     response_headers: str,
 ) -> None:
@@ -104,12 +104,12 @@ async def update_complete(
         """
         UPDATE idempotency_keys
         SET status           = 'completed',
-            response_status  = ?,
+            status_code  = ?,
             response_body    = ?,
             response_headers = ?
         WHERE key = ?
         """,
-        (response_status, response_body, response_headers, key),
+        (status_code, response_body, response_headers, key),
     )
     await db.commit()
 
@@ -117,7 +117,7 @@ async def update_complete(
 async def update_failed(
     db: aiosqlite.Connection,
     key: str,
-    response_status: int,
+    status_code: int,
     response_body: str,
     response_headers: str,
 ) -> None:
@@ -129,12 +129,12 @@ async def update_failed(
         """
         UPDATE idempotency_keys
         SET status           = 'failed',
-            response_status  = ?,
+            status_code  = ?,
             response_body    = ?,
             response_headers = ?
         WHERE key = ?
         """,
-        (response_status, response_body, response_headers, key),
+        (status_code, response_body, response_headers, key),
     )
     await db.commit()
 

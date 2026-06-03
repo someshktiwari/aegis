@@ -94,8 +94,8 @@ async def test_expired_key_treated_as_new(client, db):
     await db.execute(
         """
         INSERT INTO idempotency_keys
-            (key, fingerprint, status, response_status, response_body, response_headers, created_at)
-        VALUES (?, ?, 'COMPLETE', 200, '{"old": true}', '{}', ?)
+            (key, fingerprint, status, status_code, response_body, response_headers, created_at)
+        VALUES (?, ?, 'completed', 200, '{"old": true}', '{}', ?)
         """,
         (
             "idem-expired-001",
@@ -158,8 +158,8 @@ async def test_upstream_connection_error_returns_502_and_releases_key(client, db
     """
     When upstream raises a connection error, Aegis must:
     1. Return 502 (not 500)
-    2. Delete the PENDING row so the client can retry with the same key.
-    Before this fix: PENDING row stayed, every retry got 409 for 24h.
+    2. Delete the in_flight row so the client can retry with the same key.
+    Before this fix: in_flight row stayed, every retry got 409 for 24h.
     """
     with patch(
         "proxy.forward_to_upstream",

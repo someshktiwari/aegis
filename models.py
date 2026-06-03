@@ -5,7 +5,7 @@
 from enum import Enum
 from typing import Optional
 from sqlmodel import SQLModel, Field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 class State(str, Enum):
@@ -32,6 +32,6 @@ class IdempotencyRecord(SQLModel, table=True):
     status_code: Optional[int] = Field(default=None)
     response_headers: Optional[str] = Field(default=None)
     response_body: Optional[str] = Field(default=None)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
-    expires_at: datetime = Field(default_factory=lambda: datetime.utcnow() + timedelta(hours=24))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    expires_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc) + timedelta(hours=24))
