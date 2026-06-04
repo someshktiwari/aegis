@@ -1,12 +1,13 @@
 # proxy.py
 # The heart of Aegis. Every proxied request flows through handle_request().
 #
-# Five outcomes:
-#   1. New key          → forward to upstream, cache response if cacheable, return it
+# Six outcomes:
+#   1. New key                → forward to upstream, cache response if cacheable
 #   2. Cached (completed, same fingerprint) → return cached response immediately
-#   3. Mismatched body  → 422 Unprocessable Entity (DECISIONS.md D-006)
-#   4. Orphaned in_flight → 409 Conflict — crash recovery (DECISIONS.md D-007)
-#   5. Upstream failure → mark failed, return passthrough (key released, safe to retry)
+#   3. Mismatched body        → 422 Unprocessable Entity (DECISIONS.md D-006)
+#   4. Orphaned in_flight     → 409 Conflict — crash-recovery signal (DECISIONS.md D-007)
+#   5. Failed record          → delete, treat as new key — retry allowed
+#   6. Upstream failure       → mark failed, pass through — key released, safe to retry
 
 import json
 
@@ -66,15 +67,15 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
     Step-by-step:
     1. Read Idempotency-Key header (400 if missing)
     2. Read + fingerprint request body (SHA-256 over method + path + body)
-    3. Acquire per-key asyncio.Lock.
+    3. Acquire per-key asyncio.Lock (guarded by registry lock — see lock_manager.py)
     4. Inside the lock:
        a. Look up key in DB
-       b. If found but expired -> delete, treat as new
-       c. If found but failed -> delete, treat as new (retry allowed)
-       d. If not found -> insert in_flight, forward, handle upstream result
-       e. If in_flight -> 409 orphaned key (from previous Aegis crash only)
-       f. If completed + wrong fingerprint -> 422
-       g. If completed + correct fingerprint -> return cached response
+       b. If found but expired   → delete, treat as new
+       c. If found but failed    → delete, treat as new (retry allowed)
+       d. If not found           → insert in_flight, forward, handle upstream result
+       e. If in_flight           → 409 crash-recovery signal (orphaned from previous crash)
+       f. If completed + wrong fingerprint → 422
+       g. If completed + correct fingerprint → return cached response
     """
     idempotency_key = request.headers.get("Idempotency-Key")
     if not idempotency_key:
@@ -91,7 +92,7 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
     async with lock:
         record = await get_record(db, idempotency_key)
 
-        # Expired record: treat as brand-new key
+        # Expired record: treat as brand-new key.
         if record is not None and is_expired(record.expires_at):
             await delete_record(db, idempotency_key)
             record = None
@@ -102,14 +103,15 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
             await delete_record(db, idempotency_key)
             record = None
 
-        # New key: forward to upstream
+        # New key: forward to upstream.
         if record is None:
             await insert_in_flight(db, idempotency_key, fingerprint)
 
             try:
                 upstream_resp = await forward_to_upstream(request, body)
-            except Exception:
-                # Upstream unreachable. Delete in_flight so the key is not bricked.
+            except httpx.RequestError:
+                # Upstream unreachable or timed out.
+                # Delete in_flight so the key is not bricked — client may retry.
                 await delete_record(db, idempotency_key)
                 return _json_response(
                     {
@@ -152,7 +154,10 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
                 headers=_response_headers(upstream_resp.headers),
             )
 
-        # Orphaned in_flight: 409 (crash recovery only). See DECISIONS.md D-007.
+        # Orphaned in_flight: 409 (crash-recovery signal only).
+        # Normal concurrent duplicates never reach this branch —
+        # they block on the lock and receive the cached response.
+        # See DECISIONS.md D-007.
         if record.state == State.in_flight:
             return _json_response(
                 {
@@ -187,6 +192,10 @@ async def forward_to_upstream(request: Request, body: bytes) -> httpx.Response:
     """
     Forward the original request to the configured upstream URL.
     Strips hop-by-hop headers, Host, Content-Length, and Idempotency-Key.
+
+    Note: upstream_resp.text stores the response as a decoded string.
+    Aegis is scoped to JSON APIs — binary upstream responses are not supported.
+    See DECISIONS.md D-024 (binary response limitation).
     """
     target_url = f"{settings.upstream_url}{request.url.path}"
     if request.url.query:

@@ -509,6 +509,38 @@ involves arithmetic on the stored column.
 
 ---
 
+## D-024 · Binary Response Limitation
+
+**Decision:** Aegis stores upstream response bodies as decoded text strings
+(`upstream_resp.text`) rather than raw bytes.
+
+**Consequence:**
+Aegis is scoped to JSON APIs and text-based upstream responses. If an upstream
+returns binary content (images, PDFs, protobuf payloads), `httpx` will attempt
+UTF-8 decoding, which will either silently corrupt the data or raise a
+`UnicodeDecodeError`.
+
+**Why this is a design decision, not a bug:**
+The idempotency use case — payment processing, order creation, notification
+dispatch — is almost universally JSON over HTTP. Storing raw bytes would
+require either a `BLOB` column in SQLite or base64 encoding, both of which
+add complexity with no benefit for the target use case.
+
+**Where this constraint is enforced:**
+Documented in `forward_to_upstream()` in `proxy.py`. The constraint is
+intentional and scoped, not an oversight.
+
+**The v2 fix if binary support is needed:**
+Change the `response_body` column type to `BLOB`, store `upstream_resp.content`
+(raw bytes) instead of `upstream_resp.text`, and return `content` directly on
+cache replay. The change is contained entirely within `store.py` and `proxy.py`.
+
+**Trade-offs accepted:**
+- Binary upstream responses will corrupt silently or raise an error
+- Callers using Aegis in front of file-serving APIs must be aware of this constraint
+
+---
+
 # Part II — Build Journal
 
 > This section documents every significant bug, incorrect assumption, and
