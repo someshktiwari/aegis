@@ -170,6 +170,7 @@ Run each command in a third terminal with the venv active.
 
 ```bash
 curl -X POST http://localhost:8000/payments \
+  -H "X-API-Key: my-service" \
   -H "Idempotency-Key: test-001" \
   -H "Content-Type: application/json" \
   -d '{"amount": 500}'
@@ -181,6 +182,7 @@ curl -X POST http://localhost:8000/payments \
 
 ```bash
 curl -X POST http://localhost:8000/payments \
+  -H "X-API-Key: my-service" \
   -H "Idempotency-Key: test-001" \
   -H "Content-Type: application/json" \
   -d '{"amount": 500}'
@@ -193,6 +195,7 @@ only **ONE** hit — the second response was served from cache.
 
 ```bash
 curl -X POST http://localhost:8000/payments \
+  -H "X-API-Key: my-service" \
   -H "Idempotency-Key: test-001" \
   -H "Content-Type: application/json" \
   -d '{"amount": 999}'
@@ -203,7 +206,14 @@ curl -X POST http://localhost:8000/payments \
 ### Missing header — should return 400
 
 ```bash
+# Missing X-API-Key → 401
 curl -X POST http://localhost:8000/payments \
+  -H "Content-Type: application/json" \
+  -d '{"amount": 100}'
+
+# Missing Idempotency-Key (with valid API key) → 400
+curl -X POST http://localhost:8000/payments \
+  -H "X-API-Key: my-service" \
   -H "Content-Type: application/json" \
   -d '{"amount": 100}'
 ```
@@ -252,7 +262,7 @@ tests/test_store.py::test_delete_record_removes_row PASSED
 tests/test_store.py::test_delete_expired_removes_old_rows PASSED
 tests/test_store.py::test_delete_expired_preserves_fresh_rows PASSED
 
-19 passed in 0.04s
+21 passed in 0.04s
 ```
 
 ---
@@ -312,6 +322,19 @@ uvicorn main:app --reload --port 8000
 cd ~/Projects/aegis && source venv/bin/activate
 pytest tests/ -v
 ```
+
+---
+
+## Required Headers
+
+Every non-GET request must include both headers:
+
+```bash
+X-API-Key: <your-api-key>       # Scopes idempotency keys per caller
+Idempotency-Key: <unique-key>   # Deduplication key for this operation
+```
+
+GET requests require neither header.
 
 ---
 

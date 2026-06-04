@@ -509,35 +509,61 @@ involves arithmetic on the stored column.
 
 ---
 
-## D-024 · Binary Response Limitation
 
-**Decision:** Aegis stores upstream response bodies as decoded text strings
-(`upstream_resp.text`) rather than raw bytes.
+## D-025 · X-API-Key Header for Multi-Tenant Key Scoping
 
-**Consequence:**
-Aegis is scoped to JSON APIs and text-based upstream responses. If an upstream
-returns binary content (images, PDFs, protobuf payloads), `httpx` will attempt
-UTF-8 decoding, which will either silently corrupt the data or raise a
-`UnicodeDecodeError`.
+**Decision:** Every non-GET request must carry an `X-API-Key` header.
+Idempotency keys are scoped per caller using a composite DB key:
+`{api_key}:{idempotency_key}`.
 
-**Why this is a design decision, not a bug:**
-The idempotency use case — payment processing, order creation, notification
-dispatch — is almost universally JSON over HTTP. Storing raw bytes would
-require either a `BLOB` column in SQLite or base64 encoding, both of which
-add complexity with no benefit for the target use case.
+**The problem without scoping:**
+Without an API key, any client that guesses or reuses an `Idempotency-Key`
+value already in the DB would receive another client's cached response.
+In a payment proxy, that means Client B could receive Client A's transaction
+result — a direct data leak.
 
-**Where this constraint is enforced:**
-Documented in `forward_to_upstream()` in `proxy.py`. The constraint is
-intentional and scoped, not an oversight.
+**Why composite key and not a separate column:**
+Storing `api_key` as a separate column would require a composite primary key
+`(api_key, idempotency_key)` and a compound index. The composite string
+`{api_key}:{idempotency_key}` achieves the same isolation using the existing
+`key TEXT PRIMARY KEY` column and single-column index — zero schema change.
+The `:` separator is safe because it cannot appear in a standard UUID or
+slug idempotency key.
 
-**The v2 fix if binary support is needed:**
-Change the `response_body` column type to `BLOB`, store `upstream_resp.content`
-(raw bytes) instead of `upstream_resp.text`, and return `content` directly on
-cache replay. The change is contained entirely within `store.py` and `proxy.py`.
+**Why `X-API-Key` and not `Authorization: Bearer`:**
+`Authorization` is in the `_DENY_CACHE_HEADERS` deny-list and is stripped
+before forwarding to upstream and before storing headers in the DB. Using
+`X-API-Key` as a separate header avoids any collision with upstream auth
+and makes the Aegis authentication concern visually distinct.
+
+**Why X-API-Key is checked before Idempotency-Key:**
+Authentication precedes all other validation. A request without a valid
+API key must never reach idempotency logic regardless of what other
+headers it carries. The check order in `main.py`: GET pass-through →
+401 (no X-API-Key) → idempotency path → 400 (no Idempotency-Key).
+
+**Why GET bypasses the API key check:**
+GET requests have no side effects and are not cached. There is no data
+leak risk from an unauthenticated read-through. Requiring X-API-Key on
+GET would break every browser and health-check that accesses the proxy.
+
+**Why the server does not validate key values:**
+Aegis is a proxy, not an identity provider. Key validation (checking
+against a registry of allowed keys) would require either a local
+allowlist (operational burden) or an outbound call to an auth service
+(latency + coupling). For v1.1, any non-empty string is accepted.
+The correct v2 path: validate against a configurable allowlist in
+`config.py`, or delegate to a sidecar auth service.
+
+**Header stripping:**
+`X-API-Key` is added to `_STRIP_FORWARD` in `proxy.py` and is never
+forwarded to the upstream service. It is an Aegis concern only.
 
 **Trade-offs accepted:**
-- Binary upstream responses will corrupt silently or raise an error
-- Callers using Aegis in front of file-serving APIs must be aware of this constraint
+- No key validation — any string is accepted as a valid API key
+- No key rotation or revocation mechanism
+- The composite key format assumes `:` does not appear in idempotency key values
+
 
 ---
 

@@ -30,6 +30,10 @@ Look for: `[Aegis] Started. Upstream: http://localhost:9000 | DB: aegis.db`
 
 **Terminal 3 — commands (run everything here).**
 
+> **Required headers for all non-GET requests:**
+> - `X-API-Key: demo-client` — scopes keys per caller
+> - `Idempotency-Key: <value>` — deduplication key
+
 > **Tip:** `rm -f aegis.db` + restart Aegis between unrelated test sections
 > to avoid stale keys from earlier runs interfering.
 
@@ -41,6 +45,7 @@ Look for: `[Aegis] Started. Upstream: http://localhost:9000 | DB: aegis.db`
 
 ```bash
 curl -i -X POST http://localhost:8000/orders \
+  -H "X-API-Key: demo-client" \
   -H "Idempotency-Key: demo-001" \
   -H "Content-Type: application/json" \
   -d '{"item":"book"}'
@@ -50,9 +55,9 @@ curl -i -X POST http://localhost:8000/orders \
 
 **Verify the DB row:**
 ```bash
-sqlite3 aegis.db "SELECT key, status, status_code, expires_at FROM idempotency_keys WHERE key='demo-001';"
+sqlite3 aegis.db "SELECT key, status, status_code, expires_at FROM idempotency_keys WHERE key='demo-client:demo-001';"
 ```
-**Expect:** `demo-001|completed|200|<timestamp far in future>`
+**Expect:** `demo-client:demo-001|completed|200|<timestamp far in future>`
 
 📸 **Screenshot `02-new-key.png`** — all three terminals, upstream log showing the hit.
 
@@ -65,6 +70,7 @@ sqlite3 aegis.db "SELECT key, status, status_code, expires_at FROM idempotency_k
 Run the exact same command from Section 1:
 ```bash
 curl -i -X POST http://localhost:8000/orders \
+  -H "X-API-Key: demo-client" \
   -H "Idempotency-Key: demo-001" \
   -H "Content-Type: application/json" \
   -d '{"item":"book"}'
@@ -85,6 +91,7 @@ curl -i -X POST http://localhost:8000/orders \
 
 ```bash
 curl -i -X POST http://localhost:8000/orders \
+  -H "X-API-Key: demo-client" \
   -H "Idempotency-Key: demo-001" \
   -H "Content-Type: application/json" \
   -d '{"item":"DIFFERENT"}'
@@ -141,6 +148,7 @@ the GET was forwarded both times, not served from cache.
 ```bash
 for i in 1 2 3 4 5; do
   curl -s -o /dev/null -X POST http://localhost:8000/orders \
+    -H "X-API-Key: demo-client" \
     -H "Idempotency-Key: race-001" \
     -H "Content-Type: application/json" \
     -d '{"item":"book"}' &
@@ -151,7 +159,7 @@ echo "---done---"
 
 **Verify exactly one row:**
 ```bash
-sqlite3 aegis.db "SELECT COUNT(*) FROM idempotency_keys WHERE key='race-001';"
+sqlite3 aegis.db "SELECT COUNT(*) FROM idempotency_keys WHERE key='demo-client:race-001';"
 ```
 **Expect:** `1`
 
@@ -170,16 +178,16 @@ Check Terminal 1 — it should show exactly **ONE** upstream hit for `/orders`.
 ```bash
 sqlite3 aegis.db "INSERT INTO idempotency_keys \
   (key, fingerprint, status, created_at, expires_at) VALUES \
-  ('crash-001', 'fp-crash', 'in_flight', \
+  ('demo-client:crash-001', 'fp-crash', 'in_flight', \
   $(python3 -c 'import time; print(time.time()-300)'), \
   $(python3 -c 'import time; print(time.time()+86100)'));"
 ```
 
 **Step 2 — confirm it's stuck:**
 ```bash
-sqlite3 aegis.db "SELECT key, status FROM idempotency_keys WHERE key='crash-001';"
+sqlite3 aegis.db "SELECT key, status FROM idempotency_keys WHERE key='demo-client:crash-001';"
 ```
-**Expect:** `crash-001|in_flight`
+**Expect:** `demo-client:crash-001|in_flight`
 
 **Step 3 — restart Aegis** (Ctrl+C in Terminal 2, then):
 ```bash
@@ -194,9 +202,9 @@ uvicorn main:app --reload --port 8000
 
 **Step 4 — confirm recovery:**
 ```bash
-sqlite3 aegis.db "SELECT key, status FROM idempotency_keys WHERE key='crash-001';"
+sqlite3 aegis.db "SELECT key, status FROM idempotency_keys WHERE key='demo-client:crash-001';"
 ```
-**Expect:** `crash-001|failed`
+**Expect:** `demo-client:crash-001|failed`
 
 📸 **Screenshot `09-crash-recovery.png`** — Terminal 2 showing the recovery line + DB showing `failed`.
 
@@ -210,6 +218,7 @@ Using `crash-001` (now in `failed` state from Section 7):
 
 ```bash
 curl -i -X POST http://localhost:8000/orders \
+  -H "X-API-Key: demo-client" \
   -H "Idempotency-Key: crash-001" \
   -H "Content-Type: application/json" \
   -d '{"item":"book"}'
@@ -219,11 +228,11 @@ curl -i -X POST http://localhost:8000/orders \
 
 **Verify:**
 ```bash
-sqlite3 aegis.db "SELECT key, status FROM idempotency_keys WHERE key='crash-001';"
+sqlite3 aegis.db "SELECT key, status FROM idempotency_keys WHERE key='demo-client:crash-001';"
 ```
-**Expect:** `crash-001|completed`
+**Expect:** `demo-client:crash-001|completed`
 
-📸 **Screenshot `10-failed-retry.png`** — `200 OK` response + `crash-001|completed` in DB.
+📸 **Screenshot `10-failed-retry.png`** — `200 OK` response + `demo-client:crash-001|completed` in DB.
 
 ---
 

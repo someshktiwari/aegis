@@ -13,7 +13,7 @@ Guarantees at-most-once execution for retried HTTP requests — zero upstream ch
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![SQLite](https://img.shields.io/badge/SQLite-aiosqlite-003B57?style=flat-square&logo=sqlite&logoColor=white)](https://sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-19%20passing-brightgreen?style=flat-square)](tests/)
+[![Tests](https://img.shields.io/badge/tests-21%20passing-brightgreen?style=flat-square)](tests/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
 </div>
@@ -45,6 +45,7 @@ Client ──► Aegis :8000 ──► Your Service :9000
 
 | Request | Aegis Behaviour | Response |
 |---|---|---|
+| 🔑 **Missing X-API-Key** | Rejected before idempotency logic | `401 Unauthorized` |
 | ✅ **New key** | Forwards to upstream, caches response | Upstream's live response |
 | ♻️ **Duplicate key, same body** | Returns cached response — upstream **not called** | Cached response |
 | ❌ **Same key, different body** | Rejects — semantic violation | `422 Unprocessable Entity` |
@@ -64,9 +65,9 @@ Every idempotency record moves through three states:
                     └──────┬──────┘
                            │
         ┌──────────────────┼───────────────────┐
-        │ upstream 2xx /   │ upstream 5xx/429 /│ crash (orphan,
-        │ deterministic 4xx│ timeout           │ recovered on startup)
-        ▼                  ▼                   ▼
+        │ upstream 2xx /   │ upstream 5xx/429 / │ crash (orphan,
+        │ deterministic 4xx│ timeout            │ recovered on startup)
+        ▼                  ▼                    ▼
   ┌───────────┐      ┌──────────┐         ┌──────────┐
   │ completed │      │  failed  │         │  failed  │
   └───────────┘      └────┬─────┘         └────┬─────┘
@@ -105,6 +106,10 @@ uvicorn mock_upstream:app --port 9000
 # 6. Start Aegis (Terminal 2)
 export UPSTREAM_URL=http://localhost:9000
 uvicorn main:app --reload --port 8000
+
+# Every request requires two headers:
+#   X-API-Key: <your-api-key>      — scopes idempotency keys per caller
+#   Idempotency-Key: <unique-key>  — deduplication key for this operation
 ```
 
 Open **http://localhost:8000/docs** for the auto-generated API documentation.
@@ -112,7 +117,7 @@ Open **http://localhost:8000/docs** for the auto-generated API documentation.
 <div align="center">
 <img src="docs/screenshots/12-swagger-ui.png" alt="Swagger UI" width="820"/>
 <br/>
-<em>Auto-generated OpenAPI docs — Aegis proxies all methods on any path.</em>
+<em>Auto-generated OpenAPI docs at v1.1.0 — Aegis proxies all methods on any path.</em>
 </div>
 
 To prove every behaviour by hand, follow [`MANUAL_TESTS.md`](MANUAL_TESTS.md) — step-by-step curl walkthroughs covering new key, cache hit, 422, 400, concurrency, crash recovery, failed-retry, and TTL eviction.
@@ -129,7 +134,7 @@ A first-seen key is forwarded to upstream and the response is stored. The upstre
 <img src="docs/screenshots/02-new-key.png" alt="New key forwarded to upstream" width="950"/>
 </div>
 
-Every processed request is stored with its SHA-256 fingerprint, status, status code, cached body and headers, plus `created_at` and `expires_at` timestamps.
+Every processed request is stored with its SHA-256 fingerprint, status, status code, cached body and headers, plus `created_at` and `expires_at` timestamps. The key column stores the scoped format `{api_key}:{idempotency_key}` — isolating each caller's keys.
 
 <div align="center">
 <img src="docs/screenshots/03-new-key-db.png" alt="idempotency_keys table in DB Browser" width="950"/>
@@ -151,9 +156,17 @@ Reusing a key with a changed payload breaks the key-to-body binding. Aegis rejec
 <img src="docs/screenshots/05-mismatch-422.png" alt="422 on mismatched body" width="950"/>
 </div>
 
+### Missing X-API-Key → 401
+
+Every non-GET request must carry the `X-API-Key` header. Authentication is checked before idempotency logic.
+
+<div align="center">
+<img src="docs/screenshots/06b-missing-api-key-401.png" alt="401 on missing API key" width="950"/>
+</div>
+
 ### Missing Idempotency-Key → 400
 
-Non-GET requests must carry the header.
+With a valid API key but no `Idempotency-Key` header.
 
 <div align="center">
 <img src="docs/screenshots/06-missing-key-400.png" alt="400 on missing key" width="950"/>
@@ -191,7 +204,7 @@ A `failed` record (from a 5xx, timeout, or recovered crash) does not lock the cl
 <img src="docs/screenshots/10-failed-retry.png" alt="Failed record retried successfully" width="950"/>
 </div>
 
-### Test suite — 19 passing
+### Test suite — 21 passing
 
 <div align="center">
 <img src="docs/screenshots/11-tests-passing.png" alt="19 tests passing" width="950"/>
@@ -224,6 +237,12 @@ If Aegis crashes after writing `in_flight` but before writing the final state, t
 
 A `failed` record (transient 5xx/429 upstream, a timeout, or a recovered crash) does not lock the client out. The next request with the same key clears the failed record and re-runs the request. This is the difference between `failed` and `completed`: completed responses are cached and replayed; failed records are retried.
 
+### Multi-Tenant Key Scoping
+
+Every non-GET request must carry an `X-API-Key` header. Idempotency keys are scoped per caller — the DB lookup key is `{api_key}:{idempotency_key}`. Two clients sending the same `Idempotency-Key` value are tracked independently, with no cross-tenant cache hits or conflicts.
+
+GET requests bypass authentication entirely — reads have no side effects.
+
 ### Fingerprinting
 
 Requests are fingerprinted with SHA-256 over `method + path + body`, newline-separated so the three parts can never accidentally merge. Headers are excluded — client-injected headers (User-Agent, X-Request-ID) would cause false mismatches. A retry with the same key but a different body produces a different fingerprint and is rejected with 422.
@@ -245,15 +264,15 @@ Records expire after a configurable TTL (default: 24 hours), stored per-row as `
 ```
 Client          Aegis                   SQLite       Upstream
   │                │                      │              │
-  ├── POST ───────►│                      │              │
-  │  (+ Idem-Key)  │── get(key) ─────────►│              │
+  ├── POST ────────►│                      │              │
+  │  (+ Idem-Key)  │── get(key) ──────────►│              │
   │                │◄── None ─────────────│              │
   │                │── acquire lock(key)  │              │
-  │                │── insert in_flight ─►│              │
-  │                │───────────────────────── forward ──►│
-  │                │   (lock still held)  │              │
-  │                │◄──────────────────────── 201 ───────│
-  │                │── update completed ─►│              │
+  │                │── insert in_flight ──►│              │
+  │                │────────────────────────── forward ──►│
+  │                │   (lock still held)   │              │
+  │                │◄───────────────────────── 201 ───────│
+  │                │── update completed ──►│              │
   │                │── release lock(key)  │              │
   │◄── 201 ────────│                      │              │
 ```
@@ -266,19 +285,19 @@ Client          Aegis                   SQLite       Upstream
 ```
 Client A        Aegis                   SQLite       Upstream
   │                │                      │              │
-  ├── POST ───────►│── acquire lock(k1)   │              │
-  │                │── insert in_flight ─►│              │
-  │                │───────────────────────── forward ──►│
-  │                │   (lock held)        │              │
+  ├── POST ────────►│── acquire lock(k1)   │              │
+  │                │── insert in_flight ──►│              │
+  │                │────────────────────────── forward ──►│
+  │                │   (lock held)         │              │
 Client B           │                      │              │
-  ├── POST ───────►│                      │              │
-  │                │─ try lock(k1) → BLOCKS (waiting)    │
-  │                │◄──────────────────────── 201 ───────│
-  │                │─ update completed ──►│              │
+  ├── POST ────────►│                      │              │
+  │                │── try lock(k1) → BLOCKS (waiting)    │
+  │                │◄───────────────────────── 201 ───────│
+  │                │── update completed ──►│              │
   │                │── release lock(k1)   │              │
   │                │── B acquires lock(k1)│              │
-  │                │─ B reads completed ─►│              │
-  │◄─ 201 cached ─│ (B returns cached)    │         (not called)
+  │                │── B reads completed ─►│              │
+  │◄── 201 cached ─│ (B returns cached)    │         (not called)
 ```
 
 </details>
@@ -297,12 +316,12 @@ On next startup:
 Next request with same key:
 Client          Aegis                   SQLite
   │                │                      │
-  ├── POST ───────►│── acquire lock(key)  │
-  │                │── get(key) ─────────►│
-  │                │◄── failed ───────────│
-  │                │── clear, treat as new│
-  │                │── retry fresh ──────►│
-  │◄── 200 ────────│                      │
+  ├── POST ────────►│── acquire lock(key)  │
+  │                │── get(key) ──────────►│
+  │                │◄── failed ────────────│
+  │                │── clear, treat as new │
+  │                │── retry fresh ───────►│
+  │◄── 200 ────────│                       │
 ```
 
 </details>
@@ -348,6 +367,8 @@ aegis/
 | `PORT` | `8000` | Aegis listening port |
 | `EVICTION_INTERVAL_SECONDS` | `300` | Background sweep interval (5 minutes) |
 
+> **Note:** `X-API-Key` is a per-request header supplied by each caller — it is not a server-side config value. The server does not validate key values; any non-empty string is accepted.
+
 ---
 
 ## Tests
@@ -356,7 +377,7 @@ aegis/
 PYTHONPATH=. pytest tests/ -v
 ```
 
-19 tests covering all scenarios: new key, cache hit, 422 mismatch, 400 missing key, GET pass-through, concurrent retries, connection/timeout handling, 5xx and 429 not cached, deterministic 4xx cached, expired-key retry, and Set-Cookie stripping.
+21 tests covering all scenarios: new key, cache hit, 422 mismatch, 400 missing key, GET pass-through, concurrent retries, connection/timeout handling, 5xx and 429 not cached, deterministic 4xx cached, expired-key retry, and Set-Cookie stripping.
 
 ---
 

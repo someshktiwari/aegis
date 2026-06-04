@@ -32,24 +32,24 @@
                               │  HTTP + Idempotency-Key header
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                       AEGIS  :8000                              │
-│                                                                 │
+│                       AEGIS  :8000                               │
+│                                                                  │
 │  ┌─────────────┐    ┌──────────────────┐    ┌────────────────┐  │
 │  │  proxy.py   │───►│    store.py      │───►│   aegis.db     │  │
 │  │ (core logic)│    │  (SQLite CRUD)   │    │   (SQLite)     │  │
 │  └──────┬──────┘    └──────────────────┘    └────────────────┘  │
-│         │                                                       │
+│         │                                                        │
 │  ┌──────▼──────┐    ┌──────────────────┐                        │
 │  │lock_manager │    │   eviction.py    │                        │
 │  │(asyncio.Lock│    │ (background task)│                        │
 │  │  registry)  │    └──────────────────┘                        │
-│  └─────────────┘                                                │
+│  └─────────────┘                                                 │
 └─────────────────────────────┬───────────────────────────────────┘
                               │  HTTP (forwarded only when needed)
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   UPSTREAM SERVICE  :9000                       │
-│        (any HTTP API — payments, orders, notifications)         │
+│                   UPSTREAM SERVICE  :9000                        │
+│        (any HTTP API — payments, orders, notifications)          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -73,13 +73,35 @@ failure. Every other request is resolved inside Aegis without a network hop.
 
 ---
 
+## 2b. Request Routing Order
+
+Every non-GET request is validated in this order before reaching idempotency logic:
+
+```
+1. GET?           → pass-through to upstream (no auth required)
+2. X-API-Key?     → 401 if missing
+3. Idempotency-Key? → 400 if missing
+4. handle_request() → idempotency logic
+```
+
+**Why this order:** authentication precedes all other validation.
+A request without a valid API key must never reach idempotency logic.
+GET bypasses auth entirely — reads have no side effects.
+
+**Header lookup:** `"x-api-key" in request.headers` — FastAPI's `Headers`
+object provides O(1) case-insensitive lookup. The previous implementation
+used a list comprehension (`[h.lower() for h in request.headers.keys()]`)
+which was O(n) on every request.
+
+---
+
 ## 3. Database Schema
 
 **Single table:** `idempotency_keys`
 
 ```sql
 CREATE TABLE IF NOT EXISTS idempotency_keys (
-    key              TEXT    PRIMARY KEY,   -- client-supplied Idempotency-Key header
+    key              TEXT    PRIMARY KEY,   -- scoped key: "{api_key}:{idempotency_key}"
     fingerprint      TEXT    NOT NULL,      -- SHA-256(method + "\n" + path + "\n" + body)
     status           TEXT    NOT NULL       -- 'in_flight' | 'completed' | 'failed'
                              DEFAULT 'in_flight',
@@ -177,15 +199,15 @@ to a request that arrives after a crash wiped the in-process lock.
 ```
 Client                  Aegis                    SQLite        Upstream
   │                        │                        │               │
-  ├── POST /payments ─────►│                        │               │
-  │   Idempotency-Key: k1  │── get_record(k1) ─────►│               │
+  ├── POST /payments ──────►│                        │               │
+  │   Idempotency-Key: k1   │── get_record(k1) ──────►│               │
   │                        │◄── None ───────────────│               │
   │                        │── acquire lock(k1)     │               │
-  │                        │─ insert_in_flight(k1) ►│               │
-  │                        │──────────────────────────── forward ──►│
-  │                        │  (lock still held)     │               │
-  │                        │◄─────────────────────────── 201 ───────│
-  │                        │─ update_complete(k1) ─►│               │
+  │                        │── insert_in_flight(k1) ►│               │
+  │                        │────────────────────────────── forward ──►│
+  │                        │   (lock still held)     │               │
+  │                        │◄───────────────────────────── 201 ───────│
+  │                        │── update_complete(k1) ──►│               │
   │                        │── release lock(k1)     │               │
   │◄── 201 ────────────────│                        │               │
 ```
@@ -198,13 +220,13 @@ Client                  Aegis                    SQLite        Upstream
 ```
 Client                  Aegis                    SQLite        Upstream
   │                        │                        │               │
-  ├── POST /payments ─────►│                        │               │
-  │  Idempotency-Key: k1   │── try lock(k1) → BLOCKS                │
-  │  (same body as before) │   (A still holds it)   │               │
-  │                        │── A releases lock ────►│               │
+  ├── POST /payments ──────►│                        │               │
+  │   Idempotency-Key: k1   │── try lock(k1) → BLOCKS               │
+  │   (same body as before) │   (A still holds it)   │               │
+  │                        │── A releases lock ─────►│               │
   │                        │── acquire lock(k1)     │               │
-  │                        │── get_record(k1) ─────►│               │
-  │                        │◄── completed, fp match │               │
+  │                        │── get_record(k1) ──────►│               │
+  │                        │◄── completed, fp match ─│               │
   │◄── 201 (cached) ───────│                        │          (not called)
 ```
 
@@ -217,12 +239,12 @@ Upstream is **not called**. Response served from SQLite in ~1ms.
 
 ```
 Client                  Aegis                    SQLite        Upstream
-  │                         │                        │               │
+  │                        │                        │               │
   ├── POST /payments ──────►│                        │               │
   │   Idempotency-Key: k1   │── acquire lock(k1)     │               │
-  │   body: {amount: 999}   │── get_record(k1) ─────►│               │
+  │   body: {amount: 999}   │── get_record(k1) ──────►│               │
   │   (different body)      │◄── completed, FP MISMATCH              │
-  │◄── 422 ─────────── ─────│                        │          (not called)
+  │◄── 422 ────────────────│                        │          (not called)
 ```
 
 </details>
@@ -233,17 +255,17 @@ Client                  Aegis                    SQLite        Upstream
 ```
 Request A               Aegis                    SQLite        Upstream
   ├── POST k1 ──────────►│── acquire lock(k1)     │               │
-  │                      │── insert in_flight ───►│               │
-  │                      │──────────────────────────── forward ──►│
-  │                      │   (lock held)          │               │
+  │                      │── insert in_flight ────►│               │
+  │                      │────────────────────────────── forward ──►│
+  │                      │   (lock held)           │               │
 Request B                │                        │               │
   ├── POST k1 ──────────►│── try lock(k1)         │               │
-  │                      │   BLOCKS ────────────────────────────  │
-  │                      │◄─────────────────────────── 201 ───────│
-  │                      │── update completed ───►│               │
+  │                      │   BLOCKS ──────────────────────────────  │
+  │                      │◄───────────────────────────── 201 ───────│
+  │                      │── update completed ────►│               │
   │                      │── release lock(k1)     │               │
   │                      │── B acquires lock(k1)  │               │
-  │                      │── B reads completed ──►│               │
+  │                      │── B reads completed ───►│               │
   │◄── 201 cached ───────│                        │          (not called)
 ```
 
@@ -266,11 +288,11 @@ On next startup:
 Next request with same key:
 Client                  Aegis                    SQLite
   ├── POST k1 ──────────►│── acquire lock(k1)     │
-  │                      │── get_record(k1) ─────►│
+  │                      │── get_record(k1) ──────►│
   │                      │◄── failed ─────────────│
-  │                      │── delete_record(k1) ──►│
+  │                      │── delete_record(k1) ───►│
   │                      │── treat as new key     │
-  │                      │── insert in_flight ───►│
+  │                      │── insert in_flight ────►│
   │◄── 200 (fresh) ──────│                        │
 ```
 
@@ -281,16 +303,16 @@ Client                  Aegis                    SQLite
 
 ```
 Client                  Aegis                    SQLite        Upstream
-  │                        │                         │               │
-  ├── POST k1 ────────────►│── acquire lock(k1)      │               │
-  │   (5xx on prev attempt)│── get_record(k1) ────-─►│               │
-  │                        │◄── failed ────────────-─│               │
-  │                        │── delete_record(k1) ──-►│               │
-  │                        │─ insert_in_flight(k1) -►│               │
-  │                        │───────────────────────-───── forward ──►│
-  │                        │◄──────────────────────────── 200 ───────│
-  │                        │── update_complete(k1) ─►│               │
-  │◄── 200 (fresh) ────────│                         │               │
+  │                        │                        │               │
+  ├── POST k1 ─────────────►│── acquire lock(k1)     │               │
+  │   (5xx on prev attempt) │── get_record(k1) ──────►│               │
+  │                        │◄── failed ─────────────│               │
+  │                        │── delete_record(k1) ───►│               │
+  │                        │── insert_in_flight(k1) ►│               │
+  │                        │────────────────────────────── forward ──►│
+  │                        │◄───────────────────────────── 200 ───────│
+  │                        │── update_complete(k1) ──►│               │
+  │◄── 200 (fresh) ────────│                        │               │
 ```
 
 </details>
@@ -461,6 +483,7 @@ of access frequency. This mirrors Stripe's behaviour.
 | Status | Scenario | Meaning | Client Action |
 |---|---|---|---|
 | `200 / 201` | New key · cached replay · failed-retry | Success | — |
+| `401` | Missing `X-API-Key` | Authentication required | Add the header |
 | `400` | Missing `Idempotency-Key` on non-GET | Header is required | Add the header |
 | `409` | `in_flight` orphan found (crash recovery) | Original outcome unknown | Use a new key |
 | `422` | Same key, different body | Semantic violation — key-to-body binding broken | Fix the request |
@@ -541,4 +564,4 @@ Natural next steps after the MVP ships. None are in scope for the current versio
 ---
 
 *Author: Somesh Kant Tiwari*
-*Last updated: June 2026*
+*Last updated: June 2026 — v1.1.0*
