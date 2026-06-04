@@ -64,9 +64,9 @@ Every idempotency record moves through three states:
                     └──────┬──────┘
                            │
         ┌──────────────────┼───────────────────┐
-        │ upstream 2xx /   │ upstream 5xx/429 / │ crash (orphan,
-        │ deterministic 4xx│ timeout            │ recovered on startup)
-        ▼                  ▼                    ▼
+        │ upstream 2xx /   │ upstream 5xx/429 /│ crash (orphan,
+        │ deterministic 4xx│ timeout           │ recovered on startup)
+        ▼                  ▼                   ▼
   ┌───────────┐      ┌──────────┐         ┌──────────┐
   │ completed │      │  failed  │         │  failed  │
   └───────────┘      └────┬─────┘         └────┬─────┘
@@ -245,15 +245,15 @@ Records expire after a configurable TTL (default: 24 hours), stored per-row as `
 ```
 Client          Aegis                   SQLite       Upstream
   │                │                      │              │
-  ├── POST ────────►│                      │              │
-  │  (+ Idem-Key)  │── get(key) ──────────►│              │
+  ├── POST ───────►│                      │              │
+  │  (+ Idem-Key)  │── get(key) ─────────►│              │
   │                │◄── None ─────────────│              │
   │                │── acquire lock(key)  │              │
-  │                │── insert in_flight ──►│              │
-  │                │────────────────────────── forward ──►│
-  │                │   (lock still held)   │              │
-  │                │◄───────────────────────── 201 ───────│
-  │                │── update completed ──►│              │
+  │                │── insert in_flight ─►│              │
+  │                │───────────────────────── forward ──►│
+  │                │   (lock still held)  │              │
+  │                │◄──────────────────────── 201 ───────│
+  │                │── update completed ─►│              │
   │                │── release lock(key)  │              │
   │◄── 201 ────────│                      │              │
 ```
@@ -266,19 +266,19 @@ Client          Aegis                   SQLite       Upstream
 ```
 Client A        Aegis                   SQLite       Upstream
   │                │                      │              │
-  ├── POST ────────►│── acquire lock(k1)   │              │
-  │                │── insert in_flight ──►│              │
-  │                │────────────────────────── forward ──►│
-  │                │   (lock held)         │              │
+  ├── POST ───────►│── acquire lock(k1)   │              │
+  │                │── insert in_flight ─►│              │
+  │                │───────────────────────── forward ──►│
+  │                │   (lock held)        │              │
 Client B           │                      │              │
-  ├── POST ────────►│                      │              │
-  │                │── try lock(k1) → BLOCKS (waiting)    │
-  │                │◄───────────────────────── 201 ───────│
-  │                │── update completed ──►│              │
+  ├── POST ───────►│                      │              │
+  │                │─ try lock(k1) → BLOCKS (waiting)    │
+  │                │◄──────────────────────── 201 ───────│
+  │                │─ update completed ──►│              │
   │                │── release lock(k1)   │              │
   │                │── B acquires lock(k1)│              │
-  │                │── B reads completed ─►│              │
-  │◄── 201 cached ─│ (B returns cached)    │         (not called)
+  │                │─ B reads completed ─►│              │
+  │◄─ 201 cached ─│ (B returns cached)    │         (not called)
 ```
 
 </details>
@@ -297,12 +297,12 @@ On next startup:
 Next request with same key:
 Client          Aegis                   SQLite
   │                │                      │
-  ├── POST ────────►│── acquire lock(key)  │
-  │                │── get(key) ──────────►│
-  │                │◄── failed ────────────│
-  │                │── clear, treat as new │
-  │                │── retry fresh ───────►│
-  │◄── 200 ────────│                       │
+  ├── POST ───────►│── acquire lock(key)  │
+  │                │── get(key) ─────────►│
+  │                │◄── failed ───────────│
+  │                │── clear, treat as new│
+  │                │── retry fresh ──────►│
+  │◄── 200 ────────│                      │
 ```
 
 </details>

@@ -32,24 +32,24 @@
                               │  HTTP + Idempotency-Key header
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                       AEGIS  :8000                               │
-│                                                                  │
+│                       AEGIS  :8000                              │
+│                                                                 │
 │  ┌─────────────┐    ┌──────────────────┐    ┌────────────────┐  │
 │  │  proxy.py   │───►│    store.py      │───►│   aegis.db     │  │
 │  │ (core logic)│    │  (SQLite CRUD)   │    │   (SQLite)     │  │
 │  └──────┬──────┘    └──────────────────┘    └────────────────┘  │
-│         │                                                        │
+│         │                                                       │
 │  ┌──────▼──────┐    ┌──────────────────┐                        │
 │  │lock_manager │    │   eviction.py    │                        │
 │  │(asyncio.Lock│    │ (background task)│                        │
 │  │  registry)  │    └──────────────────┘                        │
-│  └─────────────┘                                                 │
+│  └─────────────┘                                                │
 └─────────────────────────────┬───────────────────────────────────┘
                               │  HTTP (forwarded only when needed)
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   UPSTREAM SERVICE  :9000                        │
-│        (any HTTP API — payments, orders, notifications)          │
+│                   UPSTREAM SERVICE  :9000                       │
+│        (any HTTP API — payments, orders, notifications)         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -177,15 +177,15 @@ to a request that arrives after a crash wiped the in-process lock.
 ```
 Client                  Aegis                    SQLite        Upstream
   │                        │                        │               │
-  ├── POST /payments ──────►│                        │               │
-  │   Idempotency-Key: k1   │── get_record(k1) ──────►│               │
+  ├── POST /payments ─────►│                        │               │
+  │   Idempotency-Key: k1  │── get_record(k1) ─────►│               │
   │                        │◄── None ───────────────│               │
   │                        │── acquire lock(k1)     │               │
-  │                        │── insert_in_flight(k1) ►│               │
-  │                        │────────────────────────────── forward ──►│
-  │                        │   (lock still held)     │               │
-  │                        │◄───────────────────────────── 201 ───────│
-  │                        │── update_complete(k1) ──►│               │
+  │                        │─ insert_in_flight(k1) ►│               │
+  │                        │──────────────────────────── forward ──►│
+  │                        │  (lock still held)     │               │
+  │                        │◄─────────────────────────── 201 ───────│
+  │                        │─ update_complete(k1) ─►│               │
   │                        │── release lock(k1)     │               │
   │◄── 201 ────────────────│                        │               │
 ```
@@ -198,13 +198,13 @@ Client                  Aegis                    SQLite        Upstream
 ```
 Client                  Aegis                    SQLite        Upstream
   │                        │                        │               │
-  ├── POST /payments ──────►│                        │               │
-  │   Idempotency-Key: k1   │── try lock(k1) → BLOCKS               │
-  │   (same body as before) │   (A still holds it)   │               │
-  │                        │── A releases lock ─────►│               │
+  ├── POST /payments ─────►│                        │               │
+  │  Idempotency-Key: k1   │── try lock(k1) → BLOCKS                │
+  │  (same body as before) │   (A still holds it)   │               │
+  │                        │── A releases lock ────►│               │
   │                        │── acquire lock(k1)     │               │
-  │                        │── get_record(k1) ──────►│               │
-  │                        │◄── completed, fp match ─│               │
+  │                        │── get_record(k1) ─────►│               │
+  │                        │◄── completed, fp match │               │
   │◄── 201 (cached) ───────│                        │          (not called)
 ```
 
@@ -217,12 +217,12 @@ Upstream is **not called**. Response served from SQLite in ~1ms.
 
 ```
 Client                  Aegis                    SQLite        Upstream
-  │                        │                        │               │
+  │                         │                        │               │
   ├── POST /payments ──────►│                        │               │
   │   Idempotency-Key: k1   │── acquire lock(k1)     │               │
-  │   body: {amount: 999}   │── get_record(k1) ──────►│               │
+  │   body: {amount: 999}   │── get_record(k1) ─────►│               │
   │   (different body)      │◄── completed, FP MISMATCH              │
-  │◄── 422 ────────────────│                        │          (not called)
+  │◄── 422 ─────────── ─────│                        │          (not called)
 ```
 
 </details>
@@ -233,17 +233,17 @@ Client                  Aegis                    SQLite        Upstream
 ```
 Request A               Aegis                    SQLite        Upstream
   ├── POST k1 ──────────►│── acquire lock(k1)     │               │
-  │                      │── insert in_flight ────►│               │
-  │                      │────────────────────────────── forward ──►│
-  │                      │   (lock held)           │               │
+  │                      │── insert in_flight ───►│               │
+  │                      │──────────────────────────── forward ──►│
+  │                      │   (lock held)          │               │
 Request B                │                        │               │
   ├── POST k1 ──────────►│── try lock(k1)         │               │
-  │                      │   BLOCKS ──────────────────────────────  │
-  │                      │◄───────────────────────────── 201 ───────│
-  │                      │── update completed ────►│               │
+  │                      │   BLOCKS ────────────────────────────  │
+  │                      │◄─────────────────────────── 201 ───────│
+  │                      │── update completed ───►│               │
   │                      │── release lock(k1)     │               │
   │                      │── B acquires lock(k1)  │               │
-  │                      │── B reads completed ───►│               │
+  │                      │── B reads completed ──►│               │
   │◄── 201 cached ───────│                        │          (not called)
 ```
 
@@ -266,11 +266,11 @@ On next startup:
 Next request with same key:
 Client                  Aegis                    SQLite
   ├── POST k1 ──────────►│── acquire lock(k1)     │
-  │                      │── get_record(k1) ──────►│
+  │                      │── get_record(k1) ─────►│
   │                      │◄── failed ─────────────│
-  │                      │── delete_record(k1) ───►│
+  │                      │── delete_record(k1) ──►│
   │                      │── treat as new key     │
-  │                      │── insert in_flight ────►│
+  │                      │── insert in_flight ───►│
   │◄── 200 (fresh) ──────│                        │
 ```
 
@@ -281,16 +281,16 @@ Client                  Aegis                    SQLite
 
 ```
 Client                  Aegis                    SQLite        Upstream
-  │                        │                        │               │
-  ├── POST k1 ─────────────►│── acquire lock(k1)     │               │
-  │   (5xx on prev attempt) │── get_record(k1) ──────►│               │
-  │                        │◄── failed ─────────────│               │
-  │                        │── delete_record(k1) ───►│               │
-  │                        │── insert_in_flight(k1) ►│               │
-  │                        │────────────────────────────── forward ──►│
-  │                        │◄───────────────────────────── 200 ───────│
-  │                        │── update_complete(k1) ──►│               │
-  │◄── 200 (fresh) ────────│                        │               │
+  │                        │                         │               │
+  ├── POST k1 ────────────►│── acquire lock(k1)      │               │
+  │   (5xx on prev attempt)│── get_record(k1) ────-─►│               │
+  │                        │◄── failed ────────────-─│               │
+  │                        │── delete_record(k1) ──-►│               │
+  │                        │─ insert_in_flight(k1) -►│               │
+  │                        │───────────────────────-───── forward ──►│
+  │                        │◄──────────────────────────── 200 ───────│
+  │                        │── update_complete(k1) ─►│               │
+  │◄── 200 (fresh) ────────│                         │               │
 ```
 
 </details>
