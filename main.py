@@ -65,7 +65,7 @@ app = FastAPI(
         "A Stripe-style idempotency proxy service. "
         "Guarantees at-most-once execution for retried HTTP requests."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -75,46 +75,57 @@ async def proxy_all(request: Request):
     """
     Catch-all route: every incoming request passes through this handler.
 
-    Routing logic:
-    - Non-GET with Idempotency-Key    → idempotency path (handle_request)
-    - Non-GET without Idempotency-Key → 400 (header required)
-    - GET (with or without key)       → pass-through (GET is idempotent by HTTP semantics)
+    Routing logic (in order):
+    - Any non-GET without X-API-Key    → 401 (authentication required)
+    - Non-GET with Idempotency-Key     → idempotency path (handle_request)
+    - Non-GET without Idempotency-Key  → 400 (header required)
+    - GET (with or without key)        → pass-through (GET is idempotent by HTTP semantics)
+
+    Why X-API-Key is checked first:
+    Authentication precedes all other validation. A request without a valid
+    API key should never reach idempotency logic, regardless of what other
+    headers it carries.
 
     Why GET is always pass-through:
     GET requests have no side effects — calling the same GET twice produces
     the same result without any duplicate work. Idempotency deduplication is
     only needed for state-mutating methods (POST, PUT, PATCH, DELETE).
     A GET with an Idempotency-Key header is passed through without caching —
-    applying cache semantics to a GET would serve stale data for 24h, which
-    is incorrect proxy behaviour.
-    """
-    has_key = "idempotency-key" in [h.lower() for h in request.headers.keys()]
+    applying cache semantics to a GET would serve stale data for 24h.
 
-    # ── Non-GET with key → idempotency path ──────────────────────────────────
-    if has_key and request.method != "GET":
+    Header lookup uses FastAPI's Headers object for O(1) case-insensitive access
+    rather than iterating all headers on every request.
+    """
+    # ── GET → pass-through first (no auth required for reads) ────────────────
+    if request.method == "GET":
+        body = await request.body()
+        try:
+            upstream = await forward_to_upstream(request, body)
+            return Response(
+                content=upstream.content,
+                status_code=upstream.status_code,
+                media_type=upstream.headers.get("content-type"),
+            )
+        except Exception:
+            return JSONResponse(
+                content={"error": "Upstream service unavailable."},
+                status_code=502,
+            )
+
+    # ── Non-GET: X-API-Key required ───────────────────────────────────────────
+    # O(1) case-insensitive lookup via FastAPI's Headers object.
+    if "x-api-key" not in request.headers:
+        return JSONResponse(
+            content={"error": "X-API-Key header is required"},
+            status_code=401,
+        )
+
+    # ── Non-GET with Idempotency-Key → idempotency path ──────────────────────
+    if "idempotency-key" in request.headers:
         return await handle_request(request, request.app.state.db)
 
-    # ── Non-GET without key → 400 ────────────────────────────────────────────
-    if request.method != "GET":
-        return JSONResponse(
-            content={"error": "Idempotency-Key header is required for non-GET requests"},
-            status_code=400,
-        )
-
-    # ── GET → pass-through (idempotent by HTTP semantics) ────────────────────
-    # GET is always passed through regardless of whether a key is present.
-    # Error handling: wrap in try/except so a down upstream returns 502,
-    # not a raw 500 traceback.
-    body = await request.body()
-    try:
-        upstream = await forward_to_upstream(request, body)
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            media_type=upstream.headers.get("content-type"),
-        )
-    except Exception:
-        return JSONResponse(
-            content={"error": "Upstream service unavailable."},
-            status_code=502,
-        )
+    # ── Non-GET without Idempotency-Key → 400 ────────────────────────────────
+    return JSONResponse(
+        content={"error": "Idempotency-Key header is required for non-GET requests"},
+        status_code=400,
+    )
