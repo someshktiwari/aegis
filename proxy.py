@@ -58,18 +58,29 @@ _DENY_CACHE_HEADERS = frozenset([
 # See DECISIONS.md D-021.
 _NON_CACHEABLE_STATUS = frozenset(range(500, 600)) | {408, 425, 429}
 
+# Headers stripped from the request before forwarding to upstream.
+# Idempotency-Key and X-API-Key are Aegis concerns only — the upstream
+# service should never see them.
+_STRIP_FORWARD = frozenset(["host", "content-length", "idempotency-key", "x-api-key"])
+
 
 async def handle_request(request: Request, db: aiosqlite.Connection) -> Response:
     """
     Main idempotency handler. Called by the catch-all route in main.py
     for non-GET requests that carry an Idempotency-Key header.
 
+    Multi-tenancy: the X-API-Key header is required on every request.
+    The DB lookup key is scoped per caller: "{api_key}:{idempotency_key}".
+    Two callers sending the same Idempotency-Key value are tracked independently.
+
     Step-by-step:
-    1. Read Idempotency-Key header (400 if missing)
-    2. Read + fingerprint request body (SHA-256 over method + path + body)
-    3. Acquire per-key asyncio.Lock (guarded by registry lock — see lock_manager.py)
-    4. Inside the lock:
-       a. Look up key in DB
+    1. Read X-API-Key header (401 if missing)
+    2. Read Idempotency-Key header (400 if missing)
+    3. Form scoped DB key: "{api_key}:{idempotency_key}"
+    4. Read + fingerprint request body (SHA-256 over method + path + body)
+    5. Acquire per-key asyncio.Lock (guarded by registry lock — see lock_manager.py)
+    6. Inside the lock:
+       a. Look up scoped key in DB
        b. If found but expired   → delete, treat as new
        c. If found but failed    → delete, treat as new (retry allowed)
        d. If not found           → insert in_flight, forward, handle upstream result
@@ -77,6 +88,14 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
        f. If completed + wrong fingerprint → 422
        g. If completed + correct fingerprint → return cached response
     """
+    # Multi-tenant API key — required on every request.
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        return _json_response(
+            {"error": "X-API-Key header is required"},
+            status_code=401,
+        )
+
     idempotency_key = request.headers.get("Idempotency-Key")
     if not idempotency_key:
         return _json_response(
@@ -84,35 +103,39 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
             status_code=400,
         )
 
+    # Scope the DB key per caller. Two clients sending the same Idempotency-Key
+    # value are tracked independently — no cross-tenant cache hits or conflicts.
+    scoped_key = f"{api_key}:{idempotency_key}"
+
     body: bytes = await request.body()
     fingerprint: str = compute_fingerprint(request.method, request.url.path, body)
 
     # Lock is held across the entire upstream call. See DECISIONS.md D-004.
-    lock = await lock_manager.get(idempotency_key)
+    lock = await lock_manager.get(scoped_key)
     async with lock:
-        record = await get_record(db, idempotency_key)
+        record = await get_record(db, scoped_key)
 
         # Expired record: treat as brand-new key.
         if record is not None and is_expired(record.expires_at):
-            await delete_record(db, idempotency_key)
+            await delete_record(db, scoped_key)
             record = None
 
         # Failed record: allow retry, treat as brand-new key.
         # A failed record (5xx/429 upstream or a recovered crash) is retryable.
         if record is not None and record.state == State.failed:
-            await delete_record(db, idempotency_key)
+            await delete_record(db, scoped_key)
             record = None
 
         # New key: forward to upstream.
         if record is None:
-            await insert_in_flight(db, idempotency_key, fingerprint)
+            await insert_in_flight(db, scoped_key, fingerprint)
 
             try:
                 upstream_resp = await forward_to_upstream(request, body)
             except httpx.RequestError:
                 # Upstream unreachable or timed out.
                 # Delete in_flight so the key is not bricked — client may retry.
-                await delete_record(db, idempotency_key)
+                await delete_record(db, scoped_key)
                 return _json_response(
                     {
                         "error": "Upstream service unavailable.",
@@ -125,7 +148,7 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
             if upstream_resp.status_code in _NON_CACHEABLE_STATUS:
                 await update_failed(
                     db,
-                    idempotency_key,
+                    scoped_key,
                     upstream_resp.status_code,
                     upstream_resp.text,
                     json.dumps(_cacheable_headers(upstream_resp.headers)),
@@ -138,10 +161,9 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
 
             # Cache the response. Store sanitised headers.
             cached_hdrs = _cacheable_headers(upstream_resp.headers)
-
             await update_complete(
                 db,
-                idempotency_key,
+                scoped_key,
                 upstream_resp.status_code,
                 upstream_resp.text,
                 json.dumps(cached_hdrs),
@@ -191,7 +213,8 @@ async def handle_request(request: Request, db: aiosqlite.Connection) -> Response
 async def forward_to_upstream(request: Request, body: bytes) -> httpx.Response:
     """
     Forward the original request to the configured upstream URL.
-    Strips hop-by-hop headers, Host, Content-Length, and Idempotency-Key.
+    Strips hop-by-hop headers, Host, Content-Length, Idempotency-Key,
+    and X-API-Key — these are Aegis concerns only, never forwarded upstream.
 
     Note: upstream_resp.text stores the response as a decoded string.
     Aegis is scoped to JSON APIs — binary upstream responses are not supported.
@@ -201,11 +224,10 @@ async def forward_to_upstream(request: Request, body: bytes) -> httpx.Response:
     if request.url.query:
         target_url += f"?{request.url.query}"
 
-    _strip_forward = {"host", "content-length", "idempotency-key"}
     forward_headers = {
         k: v
         for k, v in request.headers.items()
-        if k.lower() not in _strip_forward
+        if k.lower() not in _STRIP_FORWARD
     }
 
     async with httpx.AsyncClient(timeout=settings.upstream_timeout_seconds) as client:

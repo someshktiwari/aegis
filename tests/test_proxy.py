@@ -32,7 +32,7 @@ async def test_new_key_forwards_to_upstream(client):
         response = await client.post(
             "/orders",
             json={"item": "book"},
-            headers={"Idempotency-Key": "idem-new-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-new-001"},
         )
 
     assert response.status_code == 201
@@ -46,12 +46,12 @@ async def test_duplicate_key_same_body_returns_cached(client):
         r1 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-dup-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-dup-001"},
         )
         r2 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-dup-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-dup-001"},
         )
 
     assert r1.status_code == 200
@@ -68,12 +68,12 @@ async def test_key_reuse_different_body_returns_422(client):
         await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-mismatch-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-mismatch-001"},
         )
         r2 = await client.post(
             "/payments",
             json={"amount": 999},
-            headers={"Idempotency-Key": "idem-mismatch-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-mismatch-001"},
         )
 
     assert r2.status_code == 422
@@ -82,7 +82,7 @@ async def test_key_reuse_different_body_returns_422(client):
 
 @pytest.mark.asyncio
 async def test_missing_idempotency_key_returns_400(client):
-    response = await client.post("/payments", json={"amount": 100})
+    response = await client.post("/payments", json={"amount": 100}, headers={"X-API-Key": "test-key"})
     assert response.status_code == 400
     assert "Idempotency-Key" in response.json()["error"]
 
@@ -100,7 +100,7 @@ async def test_expired_key_treated_as_new(client, db):
         VALUES (?, ?, 'completed', 200, '{"old": true}', '{}', ?, ?)
         """,
         (
-            "idem-expired-001",
+            "test-key:idem-expired-001",
             __import__("hashlib").sha256(b"POST\n/payments\n" + b'{"amount": 100}').hexdigest(),
             past,
             past,
@@ -115,6 +115,7 @@ async def test_expired_key_treated_as_new(client, db):
             "/payments",
             content=b'{"amount": 100}',
             headers={
+                "X-API-Key": "test-key",
                 "Idempotency-Key": "idem-expired-001",
                 "Content-Type": "application/json",
             },
@@ -144,8 +145,8 @@ async def test_get_with_key_passes_through_without_caching(client):
     mock_resp = _make_upstream_response(200, {"items": ["a", "b"]})
 
     with patch("main.forward_to_upstream", new=AsyncMock(return_value=mock_resp)) as mock_fwd:
-        r1 = await client.get("/orders", headers={"Idempotency-Key": "get-key-001"})
-        r2 = await client.get("/orders", headers={"Idempotency-Key": "get-key-001"})
+        r1 = await client.get("/orders", headers={"X-API-Key": "test-key", "Idempotency-Key": "get-key-001"})
+        r2 = await client.get("/orders", headers={"X-API-Key": "test-key", "Idempotency-Key": "get-key-001"})
 
     assert r1.status_code == 200
     assert r2.status_code == 200
@@ -168,7 +169,7 @@ async def test_upstream_connection_error_returns_502_and_releases_key(client, db
         r1 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-conn-fail-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-conn-fail-001"},
         )
 
     assert r1.status_code == 502
@@ -182,7 +183,7 @@ async def test_upstream_connection_error_returns_502_and_releases_key(client, db
         r2 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-conn-fail-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-conn-fail-001"},
         )
 
     assert r2.status_code == 200
@@ -199,7 +200,7 @@ async def test_upstream_timeout_releases_key(client, db):
         r1 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-timeout-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-timeout-001"},
         )
 
     assert r1.status_code == 502
@@ -209,7 +210,7 @@ async def test_upstream_timeout_releases_key(client, db):
         r2 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-timeout-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-timeout-001"},
         )
 
     assert r2.status_code == 200
@@ -225,7 +226,7 @@ async def test_upstream_5xx_is_not_cached(client, db):
         r1 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-5xx-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-5xx-001"},
         )
 
     assert r1.status_code == 500
@@ -238,7 +239,7 @@ async def test_upstream_5xx_is_not_cached(client, db):
         r2 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-5xx-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-5xx-001"},
         )
 
     assert r2.status_code == 200
@@ -254,7 +255,7 @@ async def test_upstream_429_is_not_cached(client, db):
         r1 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-429-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-429-001"},
         )
 
     assert r1.status_code == 429
@@ -264,7 +265,7 @@ async def test_upstream_429_is_not_cached(client, db):
         r2 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-429-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-429-001"},
         )
 
     assert r2.status_code == 200
@@ -286,12 +287,12 @@ async def test_upstream_4xx_deterministic_is_cached(client, db):
         r1 = await client.post(
             "/payments",
             json={"amount": -1},
-            headers={"Idempotency-Key": "idem-4xx-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-4xx-001"},
         )
         r2 = await client.post(
             "/payments",
             json={"amount": -1},
-            headers={"Idempotency-Key": "idem-4xx-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-4xx-001"},
         )
 
     assert r1.status_code == 400
@@ -319,15 +320,55 @@ async def test_set_cookie_stripped_from_cached_response(client, db):
         r1 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-cookie-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-cookie-001"},
         )
         r2 = await client.post(
             "/payments",
             json={"amount": 500},
-            headers={"Idempotency-Key": "idem-cookie-001"},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-cookie-001"},
         )
 
     assert r1.status_code == 200
     assert r2.status_code == 200
     # Cached response must not contain the session cookie
     assert "set-cookie" not in {k.lower() for k in r2.headers.keys()}
+
+@pytest.mark.asyncio
+async def test_missing_api_key_returns_401(client):
+    """No X-API-Key header — must return 401 before reaching idempotency logic."""
+    response = await client.post(
+        "/payments",
+        json={"amount": 100},
+        headers={"Idempotency-Key": "some-key"},
+    )
+    assert response.status_code == 401
+    assert "X-API-Key" in response.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_api_key_scopes_idempotency_keys(client):
+    """
+    Two callers sending the same Idempotency-Key are tracked independently.
+    Client A's cache must not be served to Client B.
+    """
+    mock_resp_a = _make_upstream_response(200, {"client": "A"})
+    mock_resp_b = _make_upstream_response(200, {"client": "B"})
+
+    with patch("proxy.forward_to_upstream", new=AsyncMock(side_effect=[mock_resp_a, mock_resp_b])) as mock_fwd:
+        r_a = await client.post(
+            "/payments",
+            json={"amount": 500},
+            headers={"X-API-Key": "client-a", "Idempotency-Key": "shared-key-001"},
+        )
+        r_b = await client.post(
+            "/payments",
+            json={"amount": 500},
+            headers={"X-API-Key": "client-b", "Idempotency-Key": "shared-key-001"},
+        )
+
+    assert r_a.status_code == 200
+    assert r_b.status_code == 200
+    # Both requests must have reached upstream — same key, different API keys = different scopes
+    assert mock_fwd.call_count == 2
+    assert r_a.json()["client"] == "A"
+    assert r_b.json()["client"] == "B"
