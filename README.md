@@ -330,8 +330,8 @@ aegis/
 │   ├── conftest.py
 │   ├── test_proxy.py
 │   └── test_store.py
-├── DESIGN.md              # Architecture, DB schema, sequence diagrams
-├── DECISIONS.md           # Architectural decisions with rationale
+├── docs/DESIGN.md         # Architecture, DB schema, sequence diagrams
+├── docs/DECISIONS.md      # Architectural decisions with rationale
 ├── MANUAL_TESTS.md        # Step-by-step proof of every behaviour
 └── SETUP.md               # Setup and run guide
 ```
@@ -376,7 +376,7 @@ PYTHONPATH=. pytest tests/ -v
 
 ## Explicit Non-Goals
 
-Aegis intentionally excludes the following. Each decision is documented in `DECISIONS.md`:
+Aegis intentionally excludes the following. Each decision is documented in `docs/DECISIONS.md`:
 
 - ❌ Redis / distributed cache
 - ❌ Multi-node horizontal scaling
@@ -393,8 +393,8 @@ Aegis solves one problem on a single node, and solves it well.
 
 | Document | Contents |
 |---|---|
-| [`DESIGN.md`](DESIGN.md) | Internal architecture, DB schema, sequence diagrams, concurrency model |
-| [`DECISIONS.md`](DECISIONS.md) | Architectural decisions — every choice with full rationale |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | Internal architecture, DB schema, sequence diagrams, concurrency model |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Architectural decisions — every choice with full rationale |
 | [`MANUAL_TESTS.md`](MANUAL_TESTS.md) | Step-by-step curl proof of every behaviour |
 | [`SETUP.md`](SETUP.md) | Complete setup, run, and troubleshooting guide |
 
