@@ -13,7 +13,7 @@ and the trade-offs explicitly accepted.
 ## Table of Contents
 
 **Part I — Architectural Decisions**
-D-001 through D-023 — permanent design choices
+D-001 through D-025 — permanent design choices
 
 **Part II — Build Journal**
 Every bug fixed, every incorrect assumption corrected, every change made
@@ -128,7 +128,7 @@ request that arrives after a crash wiped the in-process lock (crash recovery).
 - `BEGIN EXCLUSIVE` — holds a write lock on the **entire DB** for the upstream call duration, blocking all other keys
 
 **Trade-offs accepted:**
-- In-process only — does not work across multiple Aegis nodes (see D-023 for v2)
+- In-process only — does not work across multiple Aegis nodes (see D-024 for v2)
 - Registry grows without bound, bounded by keys active within the TTL window
 
 ---
@@ -509,6 +509,54 @@ involves arithmetic on the stored column.
 
 ---
 
+
+## D-024 · Single-Process Concurrency Scope — Distributed Locking Deferred
+
+**Decision:** v1 correctness guarantees are explicitly scoped to a single Aegis
+process. The per-key `asyncio.Lock` (D-004) provides mutual exclusion within one
+event loop only. Distributed locking is deferred to v2.
+
+**What breaks with multiple Aegis instances:**
+The lock registry lives in process memory. Two Aegis nodes behind a load balancer
+each hold their own registry, so two concurrent requests with the same key landing
+on different nodes both pass `get(key) → not found` and both attempt
+`insert_in_flight()`.
+
+**What actually happens then:**
+The `key TEXT PRIMARY KEY` column rejects the second INSERT. Combined with
+write-before-forward (D-014), the upstream is never executed twice even across
+nodes — but the losing request crashes with an unhandled `IntegrityError` and the
+client receives a 500, instead of blocking and receiving the cached response as it
+would on a single node. The safety property survives by accident; the behavioural
+contract does not.
+
+**Alternatives considered for v2:**
+
+| Option | Mechanism | Cost |
+|---|---|---|
+| Redis `SET NX PX` | Atomic acquire with TTL as a lock lease | New infrastructure dependency; lease expiry vs. long upstream calls must be handled |
+| Postgres advisory locks | `pg_advisory_xact_lock(hash(key))` | Requires the Postgres migration first; lock lifetime tied to a transaction |
+| DB INSERT gate | Catch `IntegrityError` on the in_flight INSERT, then poll the row until it resolves | No new infrastructure; turns blocking into polling (added latency) |
+
+**Why deferred and not built now:**
+Per D-003, v1 runs on SQLite — a single-writer, single-file store that cannot be
+shared across nodes in the first place. Multi-node Aegis therefore requires the
+Postgres (or Redis) storage migration *before* distributed locking has anything to
+coordinate. Building cross-node locks on top of a single-node store would be
+coordination for a topology the storage layer cannot support. Single-process scope
+is a deliberate cut, not an oversight.
+
+**The v2 path:**
+The DB INSERT gate (already identified in D-020) is the primary candidate — it
+removes the in-memory registry entirely, survives restarts, and works across
+processes with zero new infrastructure once Postgres lands.
+
+**Trade-offs accepted:**
+- Horizontal scaling of Aegis itself is not supported in v1
+- A second node degrades duplicate handling from “block and replay” to “500 on conflict”
+- Availability is bounded by the single process (mitigated by fast startup + crash recovery on boot)
+
+---
 
 ## D-025 · X-API-Key Header for Multi-Tenant Key Scoping
 
