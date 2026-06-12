@@ -82,3 +82,39 @@ async def test_delete_expired_preserves_fresh_rows(db):
     deleted = await delete_expired(db)
     assert deleted == 0
     assert await get_record(db, "fresh-key") is not None
+
+@pytest.mark.asyncio
+async def test_recover_stuck_in_flight_flips_old_records_to_failed(db):
+    """
+    Startup crash recovery: in_flight rows older than 60 seconds are flipped
+    to failed (retryable). Fresh in_flight rows (< 60s, possibly a live slow
+    upstream call) are left untouched.
+    """
+    from store import recover_stuck_in_flight
+
+    # Plant a stuck record: created 5 minutes ago, still in_flight.
+    now = time.time()
+    await db.execute(
+        """
+        INSERT INTO idempotency_keys (key, fingerprint, status, created_at, expires_at)
+        VALUES (?, ?, 'in_flight', ?, ?)
+        """,
+        ("stuck-001", "fp-stuck", now - 300, now + 86100),
+    )
+    # Plant a fresh in_flight record (10s old) — must NOT be recovered.
+    await db.execute(
+        """
+        INSERT INTO idempotency_keys (key, fingerprint, status, created_at, expires_at)
+        VALUES (?, ?, 'in_flight', ?, ?)
+        """,
+        ("fresh-inflight-001", "fp-fresh", now - 10, now + 86390),
+    )
+    await db.commit()
+
+    recovered = await recover_stuck_in_flight(db)
+
+    assert recovered == 1
+    stuck = await get_record(db, "stuck-001")
+    assert stuck.state == State.failed
+    fresh = await get_record(db, "fresh-inflight-001")
+    assert fresh.state == State.in_flight

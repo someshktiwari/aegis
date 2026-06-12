@@ -372,3 +372,73 @@ async def test_api_key_scopes_idempotency_keys(client):
     assert mock_fwd.call_count == 2
     assert r_a.json()["client"] == "A"
     assert r_b.json()["client"] == "B"
+
+# ── Concurrency ───────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicates_execute_upstream_exactly_once(client, db):
+    """
+    THE headline guarantee: five identical requests fired concurrently must
+    produce exactly ONE upstream call. The per-key asyncio.Lock serialises
+    them; the four losers block, then read `completed` and get the cached
+    response. No request ever sees in_flight or a 409.
+    """
+    import asyncio
+
+    call_count = 0
+
+    async def slow_upstream(request, body):
+        # Sleep keeps the lock held long enough for the other four requests
+        # to arrive and block on it — this forces the race the lock prevents.
+        nonlocal call_count
+        call_count += 1
+        await asyncio.sleep(0.05)
+        return _make_upstream_response(201, {"id": "order-race"})
+
+    with patch("proxy.forward_to_upstream", new=slow_upstream):
+        responses = await asyncio.gather(*[
+            client.post(
+                "/payments",
+                json={"amount": 500},
+                headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-race-001"},
+            )
+            for _ in range(5)
+        ])
+
+    # All five callers get the same successful response...
+    assert all(r.status_code == 201 for r in responses)
+    assert all(r.json() == {"id": "order-race"} for r in responses)
+    # ...but upstream executed exactly once.
+    assert call_count == 1
+
+    # And the DB holds exactly one completed row for the scoped key.
+    from store import get_record
+    record = await get_record(db, "test-key:idem-race-001")
+    assert record is not None
+    assert record.state.value == "completed"
+
+
+# ── Crash recovery (409 orphan) ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_orphaned_in_flight_returns_409(client, db):
+    """
+    A crash-orphaned in_flight record (lock gone, row survives, not yet
+    recovered by the startup sweep) must return 409 — the original outcome
+    is unknown, so the client must use a new key. This is the ONLY path
+    that returns 409; concurrent duplicates never reach it (see test above).
+    """
+    from store import insert_in_flight
+
+    # Plant the orphan directly: an in_flight row with no lock held —
+    # exactly the state a crash leaves behind.
+    await insert_in_flight(db, "test-key:idem-orphan-001", "fp-orphan")
+
+    r = await client.post(
+        "/payments",
+        json={"amount": 500},
+        headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-orphan-001"},
+    )
+
+    assert r.status_code == 409
+    assert "unresolved in-flight" in r.json()["error"]
