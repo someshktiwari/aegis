@@ -7,7 +7,11 @@
 #   3. Mismatched body        → 422 Unprocessable Entity (DECISIONS.md D-006)
 #   4. Orphaned in_flight     → 409 Conflict — crash-recovery signal (DECISIONS.md D-007)
 #   5. Failed record          → delete, treat as new key — retry allowed
-#   6. Upstream failure       → mark failed, pass through — key released, safe to retry
+#   6. Upstream failure, two distinct paths:
+#      a. Non-cacheable status (5xx/408/425/429) → record marked failed,
+#         response passed through — retry allowed (DECISIONS.md D-021)
+#      b. Connection error / timeout → record DELETED, 502 returned —
+#         key released, safe to retry (no failed row is written)
 
 import json
 
@@ -217,8 +221,8 @@ async def forward_to_upstream(request: Request, body: bytes) -> httpx.Response:
     and X-API-Key — these are Aegis concerns only, never forwarded upstream.
 
     Note: upstream_resp.text stores the response as a decoded string.
-    Aegis is scoped to JSON APIs — binary upstream responses are not supported.
-    See DECISIONS.md D-024 (binary response limitation).
+    Aegis is scoped to JSON/text APIs — binary upstream responses are not
+    supported. Documented as an explicit non-goal in DESIGN.md §11.
     """
     target_url = f"{settings.upstream_url}{request.url.path}"
     if request.url.query:

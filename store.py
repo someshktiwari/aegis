@@ -17,7 +17,7 @@ from models import IdempotencyRecord, State
 # DDL — run once on startup via init_db()
 # expires_at stores the absolute expiry timestamp (created_at + ttl). Storing it
 # per-row lets the eviction sweep do a single indexed comparison and allows
-# different keys to carry different TTLs in future. See DECISIONS.md D-008.
+# different keys to carry different TTLs in future. See DECISIONS.md D-023.
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key             TEXT PRIMARY KEY,

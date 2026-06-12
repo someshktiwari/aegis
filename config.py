@@ -1,6 +1,6 @@
 # config.py
 # All configuration via environment variables — 12-factor app pattern.
-# See DECISIONS.md D-011.
+# See DECISIONS.md D-012.
 # pydantic-settings reads env vars with type validation and defaults.
 
 from pydantic_settings import BaseSettings, SettingsConfigDict

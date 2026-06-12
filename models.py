@@ -13,7 +13,12 @@ class State(str, Enum):
     Three-state machine for an idempotency record lifecycle.
     in_flight  — request is being forwarded to upstream, not yet resolved
     completed  — upstream responded, cached response is stored
-    failed     — upstream returned 5xx/429, timed out, or process crashed mid-request
+    failed     — upstream returned a non-cacheable status (5xx/408/425/429),
+                 or the record was a crash orphan recovered on startup
+
+    Note: connection errors and timeouts do NOT produce a failed row —
+    the in_flight record is deleted and the client gets 502 (key released).
+    See proxy.py's httpx.RequestError branch.
     """
     in_flight = "in_flight"
     completed = "completed"

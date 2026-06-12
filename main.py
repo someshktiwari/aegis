@@ -65,7 +65,7 @@ app = FastAPI(
         "A Stripe-style idempotency proxy service. "
         "Guarantees at-most-once execution for retried HTTP requests."
     ),
-    version="1.1.0",
+    version="1.1.1",
     lifespan=lifespan,
 )
 
