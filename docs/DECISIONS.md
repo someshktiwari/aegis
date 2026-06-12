@@ -285,7 +285,8 @@ The `async with httpx.AsyncClient()` pattern creates a client, makes the request
 and cleanly closes all connections — no resource leaks.
 
 **For a production extension:** a module-level `AsyncClient` with connection
-pooling would improve throughput by reusing TCP connections. See D-012 (post-MVP).
+pooling would improve throughput by reusing TCP connections. See DESIGN.md §12
+(Post-MVP Extensions).
 
 **Trade-offs accepted:**
 - A new TCP connection is established for each upstream call
@@ -355,13 +356,22 @@ and cached responses.
 
 **Headers filtered:**
 `connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`,
-`te`, `trailers`, `transfer-encoding`, `upgrade`, `content-length`
+`te`, `trailers`, `transfer-encoding`, `upgrade`, `content-length`,
+`content-encoding`
 
 **Why:**
 Hop-by-hop headers (RFC 2616 §13.5.1) are meaningful only for a single transport
 hop and must not be forwarded. Forwarding `Transfer-Encoding: chunked` confuses
 the upstream. `Content-Length` is stripped because `httpx` recalculates it for
 the forwarded request.
+
+**Why `content-encoding` is in the list (it is not hop-by-hop per the RFC):**
+`httpx` automatically decompresses response bodies. If the original
+`Content-Encoding: gzip` header were replayed alongside the already-decompressed
+bytes, the client would attempt to gunzip plain text and corrupt the response.
+The header describes an encoding that no longer exists after httpx's
+auto-decompression, so it must be stripped from every returned and cached
+response.
 
 ---
 
@@ -645,9 +655,12 @@ with body-only fingerprinting, same body + different endpoint = same fingerprint
 
 **The fix:**
 ```python
-data = method + "\n" + path + "\n" + body_str
-return hashlib.sha256(data.encode()).hexdigest()
+canonical = method.upper().encode() + b"\n" + path.encode() + b"\n" + body
+return hashlib.sha256(canonical).hexdigest()
 ```
+
+`method.upper()` normalises casing so `post` and `POST` fingerprint identically;
+working on bytes avoids decoding the body (which may not be valid UTF-8).
 
 The newline separators are intentional: they prevent `POST` + `/pay` + `ment`
 from producing the same hash as `POST` + `/payment` + `""`.
@@ -818,7 +831,7 @@ Postgres migration I'd switch to `timestamptz` — a contained change in `store.
 ## BJ-009 · `deprecation warning` on `datetime.utcnow()`
 
 **What was wrong:**
-Python 3.14 deprecated `datetime.utcnow()`. The original model used it in
+Python 3.12 deprecated `datetime.utcnow()`. The original model used it in
 `default_factory` for timestamp fields, producing `DeprecationWarning` on
 every test run.
 

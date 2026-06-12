@@ -137,7 +137,8 @@ INSERT (status = in_flight · response fields NULL · expires_at = now + TTL)
     ▼
 UPDATE (status = completed · response fields populated)
     │
-    │  upstream returns 5xx / 429 / timeout / crash
+    │  upstream returns non-cacheable status (5xx / 408 / 425 / 429)
+    │  — or crash orphan recovered on startup
     ▼
 UPDATE (status = failed · response fields populated)
     │
@@ -149,6 +150,12 @@ DELETE + re-INSERT (failed record cleared · fresh in_flight inserted)
     ▼
 DELETE (by eviction loop or on-access check)
 ```
+
+**Connection error / timeout is a separate path:** the `in_flight` row is
+**deleted** (not marked `failed`) and the client receives `502` — the key is
+released and immediately retryable. No `failed` row is ever written for a
+network-level failure; `failed` is reserved for non-cacheable upstream
+*responses* and recovered crash orphans.
 
 ---
 
@@ -162,8 +169,8 @@ DELETE (by eviction loop or on-access check)
            ┌────────────────────┼──────────────────────┐
            │                    │                       │
      upstream 2xx /       upstream 5xx /          crash (orphan
-     deterministic 4xx    429 / timeout /          recovered on
-                          non-cacheable            startup)
+     deterministic 4xx    408 / 425 / 429          recovered on
+                          (non-cacheable)          startup)
            │                    │                       │
            ▼                    ▼                       ▼
     ┌────────────┐        ┌──────────┐           ┌──────────┐
@@ -176,6 +183,10 @@ DELETE (by eviction loop or on-access check)
                          ┌──────────────┐
                          │  in_flight   │  (fresh execution)
                          └──────────────┘
+
+    Connection error / timeout (httpx.RequestError):
+    in_flight row is DELETED → client gets 502 → key released, retryable.
+    This path never produces a `failed` row (see §9, Error Taxonomy).
 ```
 
 | State | Meaning | What happens next |
@@ -542,6 +553,7 @@ or by `proxy.py`. There are no circular imports.
 | Prometheus metrics | Out of scope for this iteration |
 | Admin UI | Out of scope |
 | Library / SDK mode | Reverse proxy is cleaner — zero upstream changes needed |
+| Binary upstream responses | Responses are stored as decoded text (`response.text`); Aegis is scoped to JSON/text APIs. Binary bodies would require BLOB storage and base64 handling — out of scope for v1 |
 | LLM / AI | Unrelated to the problem domain |
 | Kubernetes manifests | Out of scope |
 
@@ -559,9 +571,10 @@ Natural next steps after the MVP ships. None are in scope for the current versio
 | **Distributed lock** | Replace `asyncio.Lock` with Redis `SET NX PX` for multi-node deployments. Only `lock_manager.py` changes. |
 | **Response streaming** | Buffer the full response before caching. Large responses would benefit from chunked caching. |
 | **Variable TTL per key** | The `expires_at` column already supports this. Add a `TTL-Override` header that overrides the global `TTL_SECONDS` at insert time. |
+| **Runtime in_flight age timeout** | Today, a crash orphan is only recovered at startup (`recover_stuck_in_flight`, 60s cutoff). If the process never restarts, the orphan returns `409` until TTL expiry. The extension: on encountering an `in_flight` record whose `created_at` is older than a threshold (e.g. 120s — beyond any legitimate upstream call given the 30s timeout), treat it as failed and allow retry with the same key, without waiting for a restart. |
 | **httpx connection pool** | Replace per-request `AsyncClient` with a module-level pooled client. Reuses TCP connections, reduces upstream latency. |
 
 ---
 
 *Author: Somesh Kant Tiwari*
-*Last updated: June 2026 — v1.1.0*
+*Last updated: June 2026 — v1.1.1*

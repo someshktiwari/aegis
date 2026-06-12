@@ -4,7 +4,7 @@ Step-by-step walkthrough that proves every behaviour of the idempotency proxy
 by hand. Each section covers: what it proves, the exact commands, and the
 expected output. Screenshot each PASS — these are your live demo evidence.
 
-The automated suite (`pytest tests/ -v`, 19 tests) proves the same conditions
+The automated suite (`pytest tests/ -v`, 24 tests) proves the same conditions
 in code. This guide is for seeing them happen live.
 
 ---
@@ -122,6 +122,34 @@ curl -i -X POST http://localhost:8000/orders \
 ```
 
 📸 **Screenshot `06-missing-key-400.png`**
+
+---
+
+## Section 4b — Missing X-API-Key: 401
+
+**Proves:** authentication precedes idempotency — a non-GET request without
+`X-API-Key` is rejected before any idempotency logic runs, even when an
+`Idempotency-Key` is present.
+
+```bash
+curl -i -X POST http://localhost:8000/orders \
+  -H "Idempotency-Key: demo-401" \
+  -H "Content-Type: application/json" \
+  -d '{"item":"book"}'
+```
+
+**Expect:** `HTTP/1.1 401 Unauthorized`
+```json
+{"error": "X-API-Key header is required"}
+```
+
+**Verify nothing was written** — the request never reached the idempotency layer:
+```bash
+sqlite3 aegis.db "SELECT COUNT(*) FROM idempotency_keys WHERE key LIKE '%demo-401';"
+```
+**Expect:** `0`
+
+📸 **Screenshot `06b-missing-api-key-401.png`**
 
 ---
 
@@ -272,12 +300,13 @@ sqlite3 aegis.db "SELECT COUNT(*) FROM idempotency_keys WHERE key='old-001';"
 | 1 | New key | Forward + cache |
 | 2 | Duplicate, same body | Cache hit, upstream not called |
 | 3 | Same key, diff body | SHA-256 fingerprint mismatch → 422 |
-| 4 | Missing header | 400 contract enforcement |
+| 4 | Missing Idempotency-Key | 400 contract enforcement |
+| 4b | Missing X-API-Key | 401 — auth precedes idempotency |
 | 5 | GET | Pass-through, never cached |
 | 6 | Concurrent retries | Per-key `asyncio.Lock` → one execution |
 | 7 | Crash recovery | Startup `recover_stuck_in_flight()` |
 | 8 | Failed retry | `failed` records are retryable |
 | 9 | TTL eviction | Background sweep on `expires_at` |
 
-These nine sections cover every guarantee Aegis makes. Captured screenshots
+These ten sections cover every guarantee Aegis makes. Captured screenshots
 are stronger interview evidence than "it has tests" — they show it running.

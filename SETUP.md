@@ -79,6 +79,7 @@ DB_PATH=aegis.db
 TTL_SECONDS=86400
 PORT=8000
 EVICTION_INTERVAL_SECONDS=300
+UPSTREAM_TIMEOUT_SECONDS=30
 EOF
 ```
 
@@ -203,7 +204,7 @@ curl -X POST http://localhost:8000/payments \
 
 **Expect:** `422 Unprocessable Content`
 
-### Missing header — should return 400
+### Missing headers — 401 then 400
 
 ```bash
 # Missing X-API-Key → 401
@@ -218,7 +219,7 @@ curl -X POST http://localhost:8000/payments \
   -d '{"amount": 100}'
 ```
 
-**Expect:** `400 Bad Request`
+**Expect:** `401 Unauthorized` for the first command, `400 Bad Request` for the second.
 
 ### GET request — should pass through
 
@@ -255,14 +256,19 @@ tests/test_proxy.py::test_upstream_5xx_is_not_cached PASSED
 tests/test_proxy.py::test_upstream_429_is_not_cached PASSED
 tests/test_proxy.py::test_upstream_4xx_deterministic_is_cached PASSED
 tests/test_proxy.py::test_set_cookie_stripped_from_cached_response PASSED
+tests/test_proxy.py::test_missing_api_key_returns_401 PASSED
+tests/test_proxy.py::test_api_key_scopes_idempotency_keys PASSED
+tests/test_proxy.py::test_concurrent_duplicates_execute_upstream_exactly_once PASSED
+tests/test_proxy.py::test_orphaned_in_flight_returns_409 PASSED
 tests/test_store.py::test_insert_in_flight_creates_record PASSED
 tests/test_store.py::test_get_record_returns_none_for_unknown_key PASSED
 tests/test_store.py::test_update_complete_transitions_status PASSED
 tests/test_store.py::test_delete_record_removes_row PASSED
 tests/test_store.py::test_delete_expired_removes_old_rows PASSED
 tests/test_store.py::test_delete_expired_preserves_fresh_rows PASSED
+tests/test_store.py::test_recover_stuck_in_flight_flips_old_records_to_failed PASSED
 
-21 passed in 0.04s
+24 passed in 0.25s
 ```
 
 ---

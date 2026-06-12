@@ -13,7 +13,7 @@ Guarantees at-most-once execution for retried HTTP requests — zero upstream ch
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![SQLite](https://img.shields.io/badge/SQLite-aiosqlite-003B57?style=flat-square&logo=sqlite&logoColor=white)](https://sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-21%20passing-brightgreen?style=flat-square)](tests/)
+[![Tests](https://img.shields.io/badge/tests-24%20passing-brightgreen?style=flat-square)](tests/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
 </div>
@@ -41,7 +41,7 @@ Client ──► Aegis :8000 ──► Your Service :9000
 
 ---
 
-## The Six Scenarios
+## The Seven Scenarios
 
 | Request | Aegis Behaviour | Response |
 |---|---|---|
@@ -65,8 +65,9 @@ Every idempotency record moves through three states:
                     └──────┬──────┘
                            │
         ┌──────────────────┼───────────────────┐
-        │ upstream 2xx /   │ upstream 5xx/429 / │ crash (orphan,
-        │ deterministic 4xx│ timeout            │ recovered on startup)
+        │ upstream 2xx /   │ upstream 5xx/408/  │ crash (orphan,
+        │ deterministic 4xx│ 425/429 (non-      │ recovered on startup)
+        │                  │ cacheable)         │
         ▼                  ▼                    ▼
   ┌───────────┐      ┌──────────┐         ┌──────────┐
   │ completed │      │  failed  │         │  failed  │
@@ -80,7 +81,8 @@ Every idempotency record moves through three states:
 
 - **in_flight** — request is being forwarded to upstream, not yet resolved
 - **completed** — upstream responded successfully; the response is cached and replayed on retry
-- **failed** — upstream returned a transient error, timed out, or the process crashed mid-request; the key is retryable
+- **failed** — upstream returned a non-cacheable status (5xx/408/425/429), or the record was a crash orphan recovered on startup; the key is retryable
+- **Connection error / timeout** — handled outside the state machine: the `in_flight` row is **deleted**, the client gets `502`, and the key is released for immediate retry. No `failed` row is written for a network-level failure.
 
 ---
 
@@ -198,16 +200,16 @@ A record orphaned by a crash (planted here as an old `in_flight` row) is recover
 
 ### Failed record → retryable
 
-A `failed` record (from a 5xx, timeout, or recovered crash) does not lock the client out. The next request with the same key clears it and re-runs fresh — here `crash-001` goes from `failed` to `completed`.
+A `failed` record (from a non-cacheable 5xx/429 response or a recovered crash) does not lock the client out. The next request with the same key clears it and re-runs fresh — here `crash-001` goes from `failed` to `completed`.
 
 <div align="center">
 <img src="docs/screenshots/10-failed-retry.png" alt="Failed record retried successfully" width="950"/>
 </div>
 
-### Test suite — 21 passing
+### Test suite — 24 passing
 
 <div align="center">
-<img src="docs/screenshots/11-tests-passing.png" alt="19 tests passing" width="950"/>
+<img src="docs/screenshots/11-tests-passing.png" alt="24 tests passing" width="950"/>
 </div>
 
 ---
@@ -235,7 +237,7 @@ If Aegis crashes after writing `in_flight` but before writing the final state, t
 
 ### Failed Records Are Retryable
 
-A `failed` record (transient 5xx/429 upstream, a timeout, or a recovered crash) does not lock the client out. The next request with the same key clears the failed record and re-runs the request. This is the difference between `failed` and `completed`: completed responses are cached and replayed; failed records are retried.
+A `failed` record (a non-cacheable 5xx/408/425/429 upstream response, or a recovered crash) does not lock the client out. A connection error or timeout never creates a `failed` record at all — the key is deleted and released with a `502`. The next request with the same key clears the failed record and re-runs the request. This is the difference between `failed` and `completed`: completed responses are cached and replayed; failed records are retried.
 
 ### Multi-Tenant Key Scoping
 
@@ -366,6 +368,7 @@ aegis/
 | `TTL_SECONDS` | `86400` | Key lifetime in seconds (24 hours) |
 | `PORT` | `8000` | Aegis listening port |
 | `EVICTION_INTERVAL_SECONDS` | `300` | Background sweep interval (5 minutes) |
+| `UPSTREAM_TIMEOUT_SECONDS` | `30` | Timeout for upstream HTTP calls |
 
 > **Note:** `X-API-Key` is a per-request header supplied by each caller — it is not a server-side config value. The server does not validate key values; any non-empty string is accepted.
 
@@ -377,7 +380,7 @@ aegis/
 PYTHONPATH=. pytest tests/ -v
 ```
 
-21 tests covering all scenarios: new key, cache hit, 422 mismatch, 400 missing key, GET pass-through, concurrent retries, connection/timeout handling, 5xx and 429 not cached, deterministic 4xx cached, expired-key retry, and Set-Cookie stripping.
+24 tests covering all scenarios: new key, cache hit, 422 mismatch, 401 missing API key, 400 missing key, API-key scoping, GET pass-through, concurrent duplicates (5 simultaneous requests → exactly one upstream execution), 409 crash orphan, startup crash recovery, connection/timeout handling, 5xx and 429 not cached, deterministic 4xx cached, expired-key retry, and Set-Cookie stripping.
 
 ---
 
