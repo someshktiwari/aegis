@@ -77,7 +77,7 @@ async def test_key_reuse_different_body_returns_422(client):
         )
 
     assert r2.status_code == 422
-    assert "different request body" in r2.json()["error"]
+    assert "reused with a different request" in r2.json()["error"]
 
 
 @pytest.mark.asyncio
@@ -442,3 +442,156 @@ async def test_orphaned_in_flight_returns_409(client, db):
 
     assert r.status_code == 409
     assert "unresolved in-flight" in r.json()["error"]
+
+@pytest.mark.asyncio
+async def test_key_reuse_different_query_string_returns_422(client):
+    """
+    Regression test for the query-string fingerprint gap.
+
+    The query string is part of the request identity: POST /pay?account=alice
+    and POST /pay?account=bob are different operations even with an identical
+    body. Before the fix, the query was forwarded upstream but excluded from
+    the fingerprint, so the second call was a silent cache hit that returned
+    alice's response for bob's request.
+    """
+    mock_resp = _make_upstream_response(200, {"paid": "alice"})
+
+    with patch("proxy.forward_to_upstream", new=AsyncMock(return_value=mock_resp)) as mock_fwd:
+        r1 = await client.post(
+            "/pay?account=alice",
+            json={"amount": 10},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-query-001"},
+        )
+        r2 = await client.post(
+            "/pay?account=bob",
+            json={"amount": 10},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-query-001"},
+        )
+
+    assert r1.status_code == 200
+    # Same key, same body, different query = different request → 422, not a cache hit
+    assert r2.status_code == 422
+    # And upstream was never called a second time under the wrong identity
+    assert mock_fwd.call_count == 1
+
+
+# ── Request identity (fingerprint scope) ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_key_reuse_different_query_string_returns_422(client):
+    """
+    The query string is part of request identity.
+
+    POST /pay?account=alice and POST /pay?account=bob are different operations
+    even when the body is byte-identical. The query is forwarded to the upstream
+    verbatim, so a fingerprint that excluded it would let the second call be
+    served alice's cached response — a wrong answer for bob, with the upstream
+    never consulted. See DECISIONS.md D-026.
+    """
+    mock_resp = _make_upstream_response(200, {"paid": "alice"})
+
+    with patch("proxy.forward_to_upstream", new=AsyncMock(return_value=mock_resp)) as mock_fwd:
+        r1 = await client.post(
+            "/pay?account=alice",
+            json={"amount": 10},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-query-001"},
+        )
+        r2 = await client.post(
+            "/pay?account=bob",
+            json={"amount": 10},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-query-001"},
+        )
+
+    assert r1.status_code == 200
+    # Different query = different request → 422, never a cache hit
+    assert r2.status_code == 422
+    # And the upstream was not called a second time under the wrong identity
+    assert mock_fwd.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_same_query_string_still_returns_cached(client):
+    """
+    Companion to the test above: adding the query to the fingerprint must not
+    break ordinary caching for requests that do carry a query string.
+    """
+    mock_resp = _make_upstream_response(200, {"paid": "alice"})
+
+    with patch("proxy.forward_to_upstream", new=AsyncMock(return_value=mock_resp)) as mock_fwd:
+        r1 = await client.post(
+            "/pay?account=alice",
+            json={"amount": 10},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-query-002"},
+        )
+        r2 = await client.post(
+            "/pay?account=alice",
+            json={"amount": 10},
+            headers={"X-API-Key": "test-key", "Idempotency-Key": "idem-query-002"},
+        )
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert mock_fwd.call_count == 1
+
+
+# ── Header relay ──────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_hop_by_hop_headers_are_not_forwarded_upstream(client):
+    """
+    Hop-by-hop headers are meaningful for one transport hop only. Relaying
+    Connection or TE to the upstream is a proxy correctness violation
+    (RFC 2616 13.5.1). Idempotency-Key and X-API-Key are Aegis concerns and
+    must not leak either. Authorization MUST survive — the upstream still has
+    to authenticate the caller. See DECISIONS.md D-015 and D-025.
+    """
+    captured = {}
+
+    async def _capture(request, body):
+        from proxy import _STRIP_FORWARD
+        captured["headers"] = {
+            k.lower(): v for k, v in request.headers.items()
+            if k.lower() not in _STRIP_FORWARD
+        }
+        return _make_upstream_response(200, {"ok": True})
+
+    with patch("proxy.forward_to_upstream", new=AsyncMock(side_effect=_capture)):
+        await client.post(
+            "/orders",
+            json={"item": "book"},
+            headers={
+                "X-API-Key": "test-key",
+                "Idempotency-Key": "idem-hdr-001",
+                "Authorization": "Bearer caller-token",
+                "Connection": "keep-alive",
+                "TE": "trailers",
+            },
+        )
+
+    sent = captured["headers"]
+    assert "connection" not in sent
+    assert "te" not in sent
+    assert "idempotency-key" not in sent
+    assert "x-api-key" not in sent
+    # The caller's credentials must reach the upstream untouched
+    assert sent["authorization"] == "Bearer caller-token"
+
+
+# ── Health endpoint ───────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_aegis_health_does_not_touch_upstream(client):
+    """
+    /_aegis/health reports on Aegis, not on the upstream. It must answer 200
+    even when the upstream is unreachable — distinguishing "Aegis is down" from
+    "the upstream is down" is the entire point of having it.
+    """
+    with patch(
+        "proxy.forward_to_upstream",
+        new=AsyncMock(side_effect=httpx.ConnectError("upstream is down")),
+    ) as mock_fwd:
+        r = await client.get("/_aegis/health")
+
+    assert r.status_code == 200
+    assert r.json()["service"] == "aegis"
+    assert mock_fwd.call_count == 0

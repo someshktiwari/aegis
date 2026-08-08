@@ -80,6 +80,7 @@ TTL_SECONDS=86400
 PORT=8000
 EVICTION_INTERVAL_SECONDS=300
 UPSTREAM_TIMEOUT_SECONDS=30
+IN_FLIGHT_RECOVERY_SECONDS=60
 EOF
 ```
 
@@ -156,8 +157,15 @@ left a stuck record:
 ### Step 9: Verify Aegis is alive
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:8000/_aegis/health
 ```
+
+**Expect:** `{"status":"ok","service":"aegis","version":"1.2.0"}`
+
+This endpoint reports on Aegis only and never contacts the upstream — so a
+`200` here with a `502` on a proxied request tells you precisely which of the
+two processes is down. The path is namespaced under `/_aegis/` because every
+other path is forwarded; a bare `/health` would shadow the upstream's own.
 
 Or open **http://localhost:8000/docs** in your browser for the full Swagger UI.
 
@@ -260,6 +268,10 @@ tests/test_proxy.py::test_missing_api_key_returns_401 PASSED
 tests/test_proxy.py::test_api_key_scopes_idempotency_keys PASSED
 tests/test_proxy.py::test_concurrent_duplicates_execute_upstream_exactly_once PASSED
 tests/test_proxy.py::test_orphaned_in_flight_returns_409 PASSED
+tests/test_proxy.py::test_key_reuse_different_query_string_returns_422 PASSED
+tests/test_proxy.py::test_same_query_string_still_returns_cached PASSED
+tests/test_proxy.py::test_hop_by_hop_headers_are_not_forwarded_upstream PASSED
+tests/test_proxy.py::test_aegis_health_does_not_touch_upstream PASSED
 tests/test_store.py::test_insert_in_flight_creates_record PASSED
 tests/test_store.py::test_get_record_returns_none_for_unknown_key PASSED
 tests/test_store.py::test_update_complete_transitions_status PASSED
@@ -268,7 +280,7 @@ tests/test_store.py::test_delete_expired_removes_old_rows PASSED
 tests/test_store.py::test_delete_expired_preserves_fresh_rows PASSED
 tests/test_store.py::test_recover_stuck_in_flight_flips_old_records_to_failed PASSED
 
-24 passed in 0.25s
+28 passed in 0.25s
 ```
 
 ---
