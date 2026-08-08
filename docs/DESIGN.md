@@ -62,13 +62,13 @@ failure. Every other request is resolved inside Aegis without a network hop.
 
 | File | Responsibility |
 |---|---|
-| `main.py` | FastAPI app · lifespan (DB init + crash recovery + eviction task) · catch-all route |
+| `main.py` | FastAPI app · lifespan (DB init + crash recovery + eviction task) · `/_aegis/health` · catch-all route |
 | `proxy.py` | Core idempotency logic — all six scenarios |
 | `store.py` | All SQLite reads and writes via `aiosqlite` |
-| `fingerprint.py` | SHA-256 hash of `method + path + body` |
+| `fingerprint.py` | SHA-256 hash of `method + path + query + body` |
 | `lock_manager.py` | Per-key `asyncio.Lock` registry guarded by a registry-level lock |
 | `eviction.py` | On-access TTL check + background bulk-delete sweep |
-| `models.py` | `State` enum · `IdempotencyRecord` SQLModel |
+| `models.py` | `State` enum · `IdempotencyRecord` Pydantic DTO |
 | `config.py` | All settings loaded from environment variables via `pydantic-settings` |
 
 ---
@@ -78,11 +78,19 @@ failure. Every other request is resolved inside Aegis without a network hop.
 Every non-GET request is validated in this order before reaching idempotency logic:
 
 ```
+0. /_aegis/health? → answered by Aegis, never forwarded
 1. GET?           → pass-through to upstream (no auth required)
 2. X-API-Key?     → 401 if missing
 3. Idempotency-Key? → 400 if missing
 4. handle_request() → idempotency logic
 ```
+
+`/_aegis/health` is declared before the catch-all so FastAPI matches it first.
+The namespace matters: Aegis forwards every other path, so a bare `/health`
+route would shadow the upstream's own health endpoint and make it unreachable
+through the proxy. The handler deliberately does not contact the upstream —
+a liveness probe that returned `502` because the *upstream* was down would
+report the opposite of what it is asked.
 
 **Why this order:** authentication precedes all other validation.
 A request without a valid API key must never reach idempotency logic.
@@ -102,7 +110,7 @@ which was O(n) on every request.
 ```sql
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key              TEXT    PRIMARY KEY,   -- scoped key: "{api_key}:{idempotency_key}"
-    fingerprint      TEXT    NOT NULL,      -- SHA-256(method + "\n" + path + "\n" + body)
+    fingerprint      TEXT    NOT NULL,      -- SHA-256(method + "\n" + path + "\n" + query + "\n" + body)
     status           TEXT    NOT NULL       -- 'in_flight' | 'completed' | 'failed'
                              DEFAULT 'in_flight',
     status_code      INTEGER,               -- HTTP status from upstream (null until resolved)
@@ -414,7 +422,7 @@ Called during FastAPI's `lifespan` context before the server begins accepting re
 
 ```python
 async def recover_stuck_in_flight(db: aiosqlite.Connection) -> int:
-    cutoff = time.time() - 60          # records stuck for > 60 seconds
+    cutoff = time.time() - settings.in_flight_recovery_seconds
     cursor = await db.execute(
         """
         UPDATE idempotency_keys
@@ -433,8 +441,11 @@ Recovery is about how long ago the request *started*, not when it expires.
 A request that started 2 minutes ago and has not resolved is a crash orphan.
 `expires_at` is 24 hours in the future and would never trigger the cutoff.
 
-**The 60-second threshold:** long enough to avoid false positives (a legitimate
-slow upstream call), short enough to recover quickly after a restart.
+**The threshold** (`IN_FLIGHT_RECOVERY_SECONDS`, default 60s): long enough to
+avoid false positives — a legitimate slow upstream call is bounded by
+`UPSTREAM_TIMEOUT_SECONDS`, default 30s — and short enough to recover quickly
+after a restart. It is configuration rather than a constant because an operator
+running a slower upstream must be able to raise it without a code change.
 
 ### Post-Recovery State
 
@@ -499,6 +510,7 @@ of access frequency. This mirrors Stripe's behaviour.
 | `409` | `in_flight` orphan found (crash recovery) | Original outcome unknown | Use a new key |
 | `422` | Same key, different body | Semantic violation — key-to-body binding broken | Fix the request |
 | `502` | Upstream unreachable or timed out | Infrastructure error | Retry later (key is released) |
+| `409` | Aegis failed after the upstream may have executed | Outcome unknown, key held | Use a new key |
 
 **Non-cacheable status codes** (upstream response passes through, key is released):
 
@@ -509,10 +521,18 @@ of access frequency. This mirrors Stripe's behaviour.
 | `408` | Request timeout — transient |
 | `425` | Too Early — TLS 1.3 race condition |
 
-**Cacheable status codes** — cached and replayed forever until TTL:
+**Cacheable status codes** — cached and replayed until TTL:
 
-All `2xx` and deterministic `4xx` (e.g. `400`, `404`, `422`). The same invalid
-input will always produce the same error; caching it prevents hammering upstream.
+Everything not named in the non-cacheable set above. This is an exclusion rule,
+not an allow-list: `2xx`, deterministic `4xx` (`400`, `404`, `422`) and also
+`3xx` redirects are all stored. The same invalid input will always produce the
+same error, so caching it prevents hammering the upstream.
+
+Caching `3xx` follows from the rule rather than from a separate decision. A
+redirect that is deterministic for a given request is as replayable as a `404`;
+one that is not deterministic is an upstream that should not be advertising it
+as a redirect. If that ever proves wrong in practice, the fix is to name `3xx`
+in `_NON_CACHEABLE_STATUS`, not to special-case it in the handler.
 
 **Why 502 and not 500 for upstream errors?**
 `500 Internal Server Error` implies the fault is in Aegis. `502 Bad Gateway`
@@ -554,6 +574,7 @@ or by `proxy.py`. There are no circular imports.
 | Admin UI | Out of scope |
 | Library / SDK mode | Reverse proxy is cleaner — zero upstream changes needed |
 | Binary upstream responses | Responses are stored as decoded text (`response.text`); Aegis is scoped to JSON/text APIs. Binary bodies would require BLOB storage and base64 handling — out of scope for v1 |
+| Query-string normalisation | Fingerprints hash the raw query bytes. `?a=1&b=2` and `?b=2&a=1` are treated as different requests — normalising would mean owning repeated-key, encoding and empty-value semantics forever. See DECISIONS.md D-026 |
 | LLM / AI | Unrelated to the problem domain |
 | Kubernetes manifests | Out of scope |
 
@@ -571,10 +592,10 @@ Natural next steps after the MVP ships. None are in scope for the current versio
 | **Distributed lock** | Replace `asyncio.Lock` with Redis `SET NX PX` for multi-node deployments. Only `lock_manager.py` changes. |
 | **Response streaming** | Buffer the full response before caching. Large responses would benefit from chunked caching. |
 | **Variable TTL per key** | The `expires_at` column already supports this. Add a `TTL-Override` header that overrides the global `TTL_SECONDS` at insert time. |
-| **Runtime in_flight age timeout** | Today, a crash orphan is only recovered at startup (`recover_stuck_in_flight`, 60s cutoff). If the process never restarts, the orphan returns `409` until TTL expiry. The extension: on encountering an `in_flight` record whose `created_at` is older than a threshold (e.g. 120s — beyond any legitimate upstream call given the 30s timeout), treat it as failed and allow retry with the same key, without waiting for a restart. |
+| **Runtime in_flight age timeout** | Today, a crash orphan is only recovered at startup (`recover_stuck_in_flight`, `IN_FLIGHT_RECOVERY_SECONDS` cutoff). If the process never restarts, the orphan returns `409` until TTL expiry. The extension: on encountering an `in_flight` record whose `created_at` is older than a threshold (e.g. 120s — beyond any legitimate upstream call given the 30s timeout), treat it as failed and allow retry with the same key, without waiting for a restart. |
 | **httpx connection pool** | Replace per-request `AsyncClient` with a module-level pooled client. Reuses TCP connections, reduces upstream latency. |
 
 ---
 
 *Author: Somesh Kant Tiwari*
-*Last updated: June 2026 — v1.1.1*
+*Last updated: August 2026 — v1.2.0*

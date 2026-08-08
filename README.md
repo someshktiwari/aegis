@@ -13,7 +13,7 @@ Guarantees at-most-once execution for retried HTTP requests — zero upstream ch
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![SQLite](https://img.shields.io/badge/SQLite-aiosqlite-003B57?style=flat-square&logo=sqlite&logoColor=white)](https://sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-24%20passing-brightgreen?style=flat-square)](tests/)
+[![Tests](https://img.shields.io/badge/tests-28%20passing-brightgreen?style=flat-square)](tests/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
 </div>
@@ -41,7 +41,7 @@ Client ──► Aegis :8000 ──► Your Service :9000
 
 ---
 
-## The Seven Scenarios
+## The Eight Scenarios
 
 | Request | Aegis Behaviour | Response |
 |---|---|---|
@@ -52,6 +52,7 @@ Client ──► Aegis :8000 ──► Your Service :9000
 | ⏳ **Same key, concurrent in-flight** | Blocks on lock — returns cached response when the first completes | Cached response |
 | 💀 **Same key, in_flight orphan from crash** | Recovered to `failed` on startup; retry re-runs the request | Fresh upstream response |
 | 🔁 **Same key, prior failure (5xx / crash)** | Treated as retryable — re-runs the request | Fresh upstream response |
+| ⌛ **Same key, past TTL** | Record deleted on access — treated as a brand-new key | Fresh upstream response |
 
 ---
 
@@ -114,12 +115,14 @@ uvicorn main:app --reload --port 8000
 #   Idempotency-Key: <unique-key>  — deduplication key for this operation
 ```
 
-Open **http://localhost:8000/docs** for the auto-generated API documentation.
+Open **http://localhost:8000/docs** for the auto-generated API documentation, and
+`curl http://localhost:8000/_aegis/health` for a liveness check that reports on
+Aegis alone and never contacts the upstream.
 
 <div align="center">
 <img src="docs/screenshots/12-swagger-ui.png" alt="Swagger UI" width="820"/>
 <br/>
-<em>Auto-generated OpenAPI docs at v1.1.0 — Aegis proxies all methods on any path.</em>
+<em>Auto-generated OpenAPI docs at v1.2.0 — Aegis proxies all methods on any path.</em>
 </div>
 
 To prove every behaviour by hand, follow [`MANUAL_TESTS.md`](MANUAL_TESTS.md) — step-by-step curl walkthroughs covering new key, cache hit, 422, 400, concurrency, crash recovery, failed-retry, and TTL eviction.
@@ -206,10 +209,10 @@ A `failed` record (from a non-cacheable 5xx/429 response or a recovered crash) d
 <img src="docs/screenshots/10-failed-retry.png" alt="Failed record retried successfully" width="950"/>
 </div>
 
-### Test suite — 24 passing
+### Test suite — 28 passing
 
 <div align="center">
-<img src="docs/screenshots/11-tests-passing.png" alt="24 tests passing" width="950"/>
+<img src="docs/screenshots/11-tests-passing.png" alt="28 tests passing" width="950"/>
 </div>
 
 ---
@@ -247,7 +250,7 @@ GET requests bypass authentication entirely — reads have no side effects.
 
 ### Fingerprinting
 
-Requests are fingerprinted with SHA-256 over `method + path + body`, newline-separated so the three parts can never accidentally merge. Headers are excluded — client-injected headers (User-Agent, X-Request-ID) would cause false mismatches. A retry with the same key but a different body produces a different fingerprint and is rejected with 422.
+Requests are fingerprinted with SHA-256 over `method + path + query + body`, newline-separated so the four parts can never accidentally merge. The query string counts because it is forwarded to the upstream verbatim — `?account=alice` and `?account=bob` are different operations even with an identical body. Headers are excluded — client-injected headers (User-Agent, X-Request-ID) would cause false mismatches. A retry with the same key but a different body produces a different fingerprint and is rejected with 422.
 
 ### TTL Eviction
 
@@ -340,7 +343,7 @@ aegis/
 ├── fingerprint.py         # SHA-256 of method + path + body
 ├── lock_manager.py        # Per-key asyncio.Lock registry
 ├── eviction.py            # TTL check + background eviction
-├── models.py              # SQLModel IdempotencyRecord + State enum
+├── models.py              # IdempotencyRecord DTO + State enum
 ├── config.py              # Environment variable settings
 ├── mock_upstream.py       # FastAPI mock upstream for local testing
 ├── docs/
@@ -369,6 +372,7 @@ aegis/
 | `PORT` | `8000` | Aegis listening port |
 | `EVICTION_INTERVAL_SECONDS` | `300` | Background sweep interval (5 minutes) |
 | `UPSTREAM_TIMEOUT_SECONDS` | `30` | Timeout for upstream HTTP calls |
+| `IN_FLIGHT_RECOVERY_SECONDS` | `60` | Age at which a startup sweep treats a surviving `in_flight` row as a crash orphan |
 
 > **Note:** `X-API-Key` is a per-request header supplied by each caller — it is not a server-side config value. The server does not validate key values; any non-empty string is accepted.
 
@@ -380,7 +384,7 @@ aegis/
 PYTHONPATH=. pytest tests/ -v
 ```
 
-24 tests covering all scenarios: new key, cache hit, 422 mismatch, 401 missing API key, 400 missing key, API-key scoping, GET pass-through, concurrent duplicates (5 simultaneous requests → exactly one upstream execution), 409 crash orphan, startup crash recovery, connection/timeout handling, 5xx and 429 not cached, deterministic 4xx cached, expired-key retry, and Set-Cookie stripping.
+28 tests covering all scenarios: new key, cache hit, 422 mismatch on body *and* on query string, 401 missing API key, 400 missing key, API-key scoping, GET pass-through, concurrent duplicates (5 simultaneous requests → exactly one upstream execution), 409 crash orphan, startup crash recovery, connection/timeout handling, 5xx and 429 not cached, deterministic 4xx cached, expired-key retry, hop-by-hop header filtering on the forward path, Set-Cookie stripping, and the Aegis health endpoint.
 
 ---
 
@@ -390,7 +394,7 @@ PYTHONPATH=. pytest tests/ -v
 |---|---|---|
 | **Framework** | FastAPI | Native async, automatic OpenAPI, dependency injection |
 | **Database** | SQLite + aiosqlite | Zero-ops, ACID, sufficient for single-node |
-| **Models** | SQLModel | Type-safe schema; the record class maps directly to the table |
+| **Models** | Pydantic | Typed DTO over hand-written SQL; the DDL in `store.py` owns the schema |
 | **Locking** | asyncio.Lock | Per-key in-process lock held across the upstream call |
 | **Fingerprint** | SHA-256 (hashlib) | Collision-resistant, stdlib, zero dependencies |
 | **HTTP client** | httpx AsyncClient | Async-native, mirrors requests API |
@@ -426,6 +430,6 @@ Aegis solves one problem on a single node, and solves it well.
 
 <div align="center">
 
-Built by **[Somesh Kant Tiwari](https://www.linkedin.com/in/someshkanttiwari/)** · [GitHub](https://github.com/someshktiwari)
+Built by **[Somesh Kant Tiwari](https://www.linkedin.com/in/someshktiwari/)** · [GitHub](https://github.com/someshktiwari)
 
 </div>

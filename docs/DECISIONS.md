@@ -13,11 +13,11 @@ and the trade-offs explicitly accepted.
 ## Table of Contents
 
 **Part I — Architectural Decisions**
-D-001 through D-025 — permanent design choices
+D-001 through D-028 — permanent design choices
 
 **Part II — Build Journal**
-Every bug fixed, every incorrect assumption corrected, every change made
-during the build — with the reasoning behind each correction.
+BJ-001 through BJ-011 — every bug fixed, every incorrect assumption corrected,
+every change made during and after the build, with the reasoning behind each.
 
 ---
 
@@ -129,14 +129,17 @@ request that arrives after a crash wiped the in-process lock (crash recovery).
 
 **Trade-offs accepted:**
 - In-process only — does not work across multiple Aegis nodes (see D-024 for v2)
-- Registry grows without bound, bounded by keys active within the TTL window
+- The lock registry is never pruned. It holds one `asyncio.Lock` per unique
+  scoped key seen since process start, for the lifetime of the process — the
+  TTL sweep deletes database rows and does not touch the registry. See D-020
 
 ---
 
 ## D-005 · SHA-256 for Body Fingerprinting
 
-**Decision:** Request bodies are hashed with SHA-256 (`hashlib.sha256`).
-The fingerprint covers `method + "\n" + path + "\n" + body`.
+**Decision:** Requests are hashed with SHA-256 (`hashlib.sha256`).
+The fingerprint covers `method + "\n" + path + "\n" + query + "\n" + body`.
+Why the query string is in there is D-026; this entry covers the hash choice.
 
 **Why include method and path (not body alone):**
 Hashing only the body causes cross-endpoint collisions. A POST to `/payments`
@@ -351,27 +354,33 @@ The combined lock + write-before-call sequence guarantees:
 
 ## D-015 · Hop-by-Hop Header Filtering
 
-**Decision:** HTTP hop-by-hop headers are stripped from both forwarded requests
-and cached responses.
+**Decision:** HTTP hop-by-hop headers are stripped in both directions —
+from requests forwarded upstream, and from responses returned or cached.
+`content-encoding` is stripped on the response side **only**.
 
-**Headers filtered:**
+**Hop-by-hop set (both directions):**
 `connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`,
-`te`, `trailers`, `transfer-encoding`, `upgrade`, `content-length`,
-`content-encoding`
+`te`, `trailers`, `transfer-encoding`, `upgrade`, `content-length`
 
 **Why:**
 Hop-by-hop headers (RFC 2616 §13.5.1) are meaningful only for a single transport
-hop and must not be forwarded. Forwarding `Transfer-Encoding: chunked` confuses
-the upstream. `Content-Length` is stripped because `httpx` recalculates it for
-the forwarded request.
+hop and must not be relayed by a proxy. Forwarding `Transfer-Encoding: chunked`
+confuses the upstream. `Content-Length` is stripped because `httpx` recalculates
+it for the forwarded request.
 
-**Why `content-encoding` is in the list (it is not hop-by-hop per the RFC):**
-`httpx` automatically decompresses response bodies. If the original
-`Content-Encoding: gzip` header were replayed alongside the already-decompressed
-bytes, the client would attempt to gunzip plain text and corrupt the response.
-The header describes an encoding that no longer exists after httpx's
-auto-decompression, so it must be stripped from every returned and cached
-response.
+**Why `content-encoding` is response-only (it is not hop-by-hop per the RFC):**
+`httpx` automatically decompresses *response* bodies. Replaying the original
+`Content-Encoding: gzip` alongside already-decompressed bytes would make the
+client try to gunzip plain text and corrupt the response. The header describes
+an encoding that no longer exists.
+
+Nothing equivalent happens on the request side. Starlette hands the handler the
+request body exactly as it arrived — still compressed if the client compressed
+it. Stripping `Content-Encoding` there while forwarding the compressed bytes
+would leave the upstream unable to decode its own payload. The asymmetry between
+the two strip-lists is deliberate and is the answer to "why isn't there one
+list?": on the response side a library has already transformed the body, on the
+request side nothing has.
 
 ---
 
@@ -431,8 +440,8 @@ sweep was changed from `created_at + TTL` to the stored `expires_at` column.)*
 
 ## D-020 · `cleanup()` Intentionally Omitted from `LockManager`
 
-**Decision:** `LockManager` has no `cleanup()` method. The lock registry
-grows without bound (bounded in practice by keys active within the TTL window).
+**Decision:** `LockManager` has no `cleanup()` method. The lock registry grows
+monotonically for the lifetime of the process.
 
 **Why no cleanup:**
 Safely removing a lock entry mid-flight is racy. A waiting coroutine holds a
@@ -441,14 +450,23 @@ while another coroutine holds that reference, the next `get(key)` call creates
 a new, independent `Lock` — breaking mutual exclusion.
 
 **Why it's acceptable:**
-The registry is bounded by the number of unique keys active within the TTL window.
-For a 24-hour TTL and a workload of 1,000 unique keys/hour, the registry holds
-at most ~24,000 entries — negligible memory.
+Note what the bound is *not*. The TTL sweep in `eviction.py` deletes rows from
+SQLite; it never touches this dict. So the registry is not bounded by the TTL
+window — it holds one entry per unique scoped key seen since the process
+started, and only a restart clears it.
+
+It is accepted anyway. An `asyncio.Lock` is tens of bytes, so a process serving
+a million unique keys between deploys carries a registry in the tens of
+megabytes, and Aegis is restarted on every deploy. The honest framing is that
+this is a leak with a known ceiling on process lifetime rather than a bounded
+cache — and that the fix is not cleanup but removing the registry entirely.
 
 **The v2 fix:**
 Replace the in-memory lock entirely with a DB `INSERT` gated by the `PRIMARY KEY /
-IntegrityError`. No registry, no cleanup concern, survives restarts, works
-across processes. This is the correct production path.
+IntegrityError`. No registry, no leak, no cleanup concern, survives restarts,
+works across processes. This is the correct production path — and it is the same
+change D-024 needs for multi-node support, which is why it is the one v2 item
+worth doing before any other.
 
 ---
 
@@ -469,6 +487,14 @@ input**. A `400 Bad Request` (invalid payload) is deterministic — the same inp
 always produces the same error. A `429` is not — the same input will succeed after
 the rate limit resets.
 
+**This is an exclusion rule, not an allow-list.** `_NON_CACHEABLE_STATUS` names
+what is *not* cached; everything else is, including `3xx` redirects. That is a
+consequence of the rule rather than a separate decision, and it is the honest
+answer to "do you cache redirects?" — yes, because a deterministic redirect is
+as replayable as a deterministic `404`. Should that prove wrong for a given
+upstream, the change is to add `3xx` to the frozenset, not to special-case it in
+the handler.
+
 ---
 
 ## D-022 · Response Header Deny-List
@@ -484,6 +510,12 @@ and before replaying from cache:
 Replaying client A's session cookie to a later caller via a cached response is
 a direct session-leak vulnerability. These headers are still returned on the
 **first (live) response** — only the stored/replayed copy is scrubbed.
+
+**Scope: this is a cache deny-list, not a forwarding deny-list.** It is applied
+in `_cacheable_headers()`, which only ever sees *response* headers on their way
+into SQLite. It has no effect on the request path. The `authorization` entry
+therefore means "never store an upstream's `Authorization` response header",
+not "never forward the caller's credentials" — see D-025.
 
 ---
 
@@ -589,10 +621,16 @@ The `:` separator is safe because it cannot appear in a standard UUID or
 slug idempotency key.
 
 **Why `X-API-Key` and not `Authorization: Bearer`:**
-`Authorization` is in the `_DENY_CACHE_HEADERS` deny-list and is stripped
-before forwarding to upstream and before storing headers in the DB. Using
-`X-API-Key` as a separate header avoids any collision with upstream auth
-and makes the Aegis authentication concern visually distinct.
+The caller's `Authorization` header belongs to the upstream and is forwarded
+untouched — a transparent proxy that stripped caller credentials would break
+every authenticated upstream. Aegis needs a tenant identifier of its own that
+it can consume and remove without interfering with that, so it uses a separate
+header. This also keeps the Aegis authentication concern visually distinct from
+the upstream's.
+
+(`authorization` does appear in `_DENY_CACHE_HEADERS`, but that list governs
+response headers on their way into the cache — see D-022. It has no effect on
+what is forwarded.)
 
 **Why X-API-Key is checked before Idempotency-Key:**
 Authentication precedes all other validation. A request without a valid
@@ -621,6 +659,130 @@ forwarded to the upstream service. It is an Aegis concern only.
 - No key validation — any string is accepted as a valid API key
 - No key rotation or revocation mechanism
 - The composite key format assumes `:` does not appear in idempotency key values
+
+
+---
+
+## D-026 · Query String Is Part of Request Identity
+
+**Decision:** The fingerprint covers `method + "\n" + path + "\n" + query + "\n" + body`.
+The query string is hashed as raw bytes, exactly as received — not parsed,
+not sorted, not normalised.
+
+**Why the query is in the fingerprint at all:**
+`forward_to_upstream()` appends the query to the target URL, so the upstream
+executes on it. `POST /pay?account=alice` and `POST /pay?account=bob` are
+different operations even when the body is byte-identical. Anything the
+upstream acts on is part of what the request *is*, and therefore part of what
+the fingerprint must cover.
+
+Leaving it out has a specific and severe failure mode: a second request with
+the same key, the same body and a different query is a fingerprint match, so
+it is served the first request's cached response and the upstream is never
+called. Bob receives alice's result, and Aegis reports success for an
+operation it never performed. That is the exact class of wrong answer
+idempotency exists to prevent, arrived at from the other direction.
+
+**Alternatives considered:**
+
+| Option | Why not |
+|---|---|
+| Parse and sort parameters | Requires owning repeated-key semantics (`?a=1&a=2`), percent-encoding equivalence, and empty-vs-absent values — permanently, across every upstream Aegis fronts |
+| Hash only the path | The failure above |
+| Include the full URL string | Includes scheme and host, which are Aegis's concern rather than the request's identity |
+
+**Why raw bytes and not normalisation:**
+`?a=1&b=2` and `?b=2&a=1` fingerprint differently, and that is the intended
+behaviour. A client sending semantically-equal-but-textually-different queries
+under a single `Idempotency-Key` has already broken the key-to-request binding
+that D-006 rests on; Aegis returning `422` is a correct signal, not a false
+positive. Normalisation would trade one line of code for a permanent surface of
+encoding edge cases, in exchange for tolerating clients that should be fixed.
+
+**What would change this:** a client library outside our control that reorders
+query parameters between retries. That is a real thing in the wild, and if one
+appears the answer is canonicalisation behind a config flag, defaulting off.
+
+**Trade-offs accepted:**
+- Reordered query parameters produce `422` rather than a cache hit
+- Adding a component changes every fingerprint, including for requests with no
+  query at all — the canonical form gains a separator either way. Records
+  written before this change mismatch on next access and return `422` until
+  they age out of the TTL window. Acceptable for a change shipped between
+  versions; a fingerprint scheme expected to change repeatedly would carry a
+  version prefix in the canonical string and treat unknown versions as expired
+
+---
+
+## D-027 · `IdempotencyRecord` Is a DTO, Not an ORM Entity
+
+**Decision:** `models.py` defines a plain Pydantic `BaseModel`. The schema is
+owned by the hand-written DDL in `store.py`. `sqlmodel` and `SQLAlchemy` are
+not dependencies.
+
+**What was there before:** `IdempotencyRecord(SQLModel, table=True)`, which
+declares an ORM-mapped table. It was never used as one — `SQLModel.metadata.create_all()`
+is never called, every query in `store.py` is hand-written SQL, and the model's
+`idempotency_key` / `state` attributes do not match the table's `key` / `status`
+columns. The declaration implied a mapping that did not exist, and carried two
+dependencies to do nothing.
+
+**Why a DTO is the right shape here:**
+Aegis issues eight statements against one table. An ORM buys query construction,
+relationship loading and migrations; Aegis needs none of the three. What it does
+need is that a row comes back as something with attributes instead of `row[0]`
+through `row[7]`, and a Pydantic model provides exactly that with a dependency
+already present via FastAPI.
+
+**Why the names still differ from the columns:**
+`key` and `status` are the right names in SQL — `idempotency_keys.idempotency_key`
+would stutter, and `status` is conventional for a state column. `idempotency_key`
+and `state` are the right names in Python, where there is no table name for
+context and `State` is the enum's name. The translation happens in exactly one
+place, `store.get_record()`, which is also the only function that needs to know
+column order.
+
+**Trade-offs accepted:**
+- Schema changes require editing the DDL and `get_record()` together
+- No migration tooling; a column addition is a manual `ALTER TABLE`
+
+---
+
+## D-028 · Unresolved Outcomes Hold the Key Rather Than Releasing It
+
+**Decision:** If Aegis fails *after* the upstream may have executed, the
+`in_flight` row is left in place and the client receives `409`. The key is not
+released and no `failed` record is written.
+
+**The three failure paths, and why they differ:**
+
+| Failure | Did the upstream run? | Action | Response |
+|---|---|---|---|
+| `httpx.RequestError` (unreachable, timeout) | Assumed no | Delete the row — key released | `502` |
+| Non-cacheable status (`5xx`/`408`/`425`/`429`) | Yes, and it told us so | Mark `failed` — retryable | Upstream's status |
+| Anything else, after the call was made | **Unknown** | Leave `in_flight` — key held | `409` |
+
+**Why the third row cannot behave like the first:**
+The tempting cleanup is to delete the row in a broad `except` so no key is ever
+stuck. That is precisely wrong. If the upstream executed and Aegis then failed
+while writing the outcome, deleting the row releases the key, and the client's
+retry executes the operation a second time. A stuck key is an inconvenience; a
+duplicate charge is the failure this entire service exists to prevent. When the
+outcome is unknown, saying so is the only safe answer.
+
+**Why `409` and not `500`:**
+The client's required action is identical to the crash-orphan case — use a new
+`Idempotency-Key`, because the original outcome cannot be determined. Same
+situation from the caller's side, same status, same hint.
+
+**How the key eventually clears:**
+Via `recover_stuck_in_flight()` on the next restart, or by ageing out of the
+TTL window. DESIGN.md §12 carries the runtime version of that sweep as a
+post-MVP extension.
+
+**Trade-offs accepted:**
+- A rare Aegis-side fault renders one key unusable until restart or TTL expiry
+- The client must generate a new key, which requires them to handle `409`
 
 
 ---
@@ -664,6 +826,9 @@ working on bytes avoids decoding the body (which may not be valid UTF-8).
 
 The newline separators are intentional: they prevent `POST` + `/pay` + `ment`
 from producing the same hash as `POST` + `/payment` + `""`.
+
+**Follow-up:** this fix was still incomplete — the query string remained
+outside the hash until the v1.2.0 audit. See D-026 and BJ-011.
 
 ---
 
@@ -731,8 +896,10 @@ creates a new, independent `Lock` — and two coroutines now hold different
 locks for the same key. Mutual exclusion is broken.
 
 **The fix:**
-Removed `cleanup()` entirely. Registry grows, bounded by the TTL window.
-V2 path: replace in-memory lock with a DB `PRIMARY KEY / IntegrityError` gate.
+Removed `cleanup()` entirely. The registry now grows monotonically and is
+cleared only by process restart — see D-020, which corrects an earlier claim
+that the TTL window bounded it. V2 path: replace the in-memory lock with a DB
+`PRIMARY KEY / IntegrityError` gate.
 
 ---
 
@@ -858,5 +1025,64 @@ corresponding test assertion from `assert r.status_code == 500` to
 
 ---
 
+---
+
+## BJ-011 · Documentation Drift Audit (v1.1.1 → v1.2.0)
+
+**What prompted it:**
+The docs and the code were written alongside each other and then edited
+separately. Between v1.0 and v1.1.1 several claims in DECISIONS.md and the
+README stopped being true of the code they described, and nothing catches that
+— tests assert on behaviour, not on prose. Every doc claim was therefore
+checked against the running code, and the ones that failed are below.
+
+**What the audit found in the code:**
+
+- **Query string absent from the fingerprint.** The most serious defect in the
+  project's history: the query was forwarded upstream but excluded from the
+  hash, so the same key with a different query was a silent cache hit serving
+  another caller's response. Reproduced live before fixing; regression test in
+  `test_key_reuse_different_query_string_returns_422`. Now D-026.
+- **Hop-by-hop headers were never stripped on the forward path.** `_HOP_BY_HOP`
+  was referenced only by the two response helpers, while D-015 and two code
+  comments asserted it applied in both directions. Fixing it surfaced the
+  `content-encoding` asymmetry now documented in D-015.
+- **Only `httpx.RequestError` was handled around the upstream call.** Any other
+  exception left an orphaned `in_flight` row and returned an unhandled `500`.
+  Now D-028.
+- **`/health` did not exist.** SETUP.md told the reader to curl it to verify
+  Aegis was alive; the catch-all forwarded it, so the response came from the
+  upstream and would report `502` whenever the upstream — not Aegis — was down.
+  Now `/_aegis/health`.
+
+**What the audit found in the docs alone:**
+
+- D-004, D-020 and BJ-004 all claimed the lock registry was "bounded by keys
+  active within the TTL window". Nothing in the code connects the two. D-004's
+  own wording gave it away: "grows without bound, bounded by…". Corrected to
+  describe a monotonic registry cleared only by restart.
+- D-025 claimed the caller's `Authorization` header was stripped before
+  forwarding. It was not, and it must not be — the upstream still has to
+  authenticate the caller. The deny-list it referred to governs cached response
+  headers only. Corrected in D-022 and D-025.
+- D-021 and DESIGN §9 described caching as an allow-list ("all 2xx and
+  deterministic 4xx") when the code excludes a named set and caches everything
+  else, `3xx` included. Restated as the exclusion rule it is.
+- `MANUAL_TESTS.md` §4 sent neither header and expected `400`; the actual
+  response is `401`, because auth is checked first exactly as D-025 specifies.
+  The section predated D-025 and had never been re-run.
+- The README claimed SQLModel mapped the record class to the table. It did not.
+  Now D-027.
+
+**The lesson worth keeping:**
+Every one of these was introduced by a change that was *correct in the code*
+and left a doc sentence behind. The failure mode is not carelessness at the
+time of writing, it is that prose has no test. The cheapest guard is the one
+used here: read each claim with the code open and check it, on a schedule
+rather than when something feels wrong.
+
+
+---
+
 *Author: Somesh Kant Tiwari*
-*Last updated: June 2026*
+*Last updated: August 2026 — v1.2.0*

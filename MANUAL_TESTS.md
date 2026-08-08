@@ -4,7 +4,7 @@ Step-by-step walkthrough that proves every behaviour of the idempotency proxy
 by hand. Each section covers: what it proves, the exact commands, and the
 expected output. Screenshot each PASS — these are your live demo evidence.
 
-The automated suite (`pytest tests/ -v`, 24 tests) proves the same conditions
+The automated suite (`pytest tests/ -v`, 28 tests) proves the same conditions
 in code. This guide is for seeing them happen live.
 
 ---
@@ -108,10 +108,16 @@ curl -i -X POST http://localhost:8000/orders \
 
 ## Section 4 — Missing Idempotency-Key: 400
 
-**Proves:** non-GET requests must carry the header.
+**Proves:** an authenticated non-GET request must still carry the
+`Idempotency-Key` header.
+
+The `X-API-Key` header is present here on purpose. Authentication is checked
+first, so a request missing both headers returns `401`, not `400` — that case
+is Section 4b.
 
 ```bash
 curl -i -X POST http://localhost:8000/orders \
+  -H "X-API-Key: demo-client" \
   -H "Content-Type: application/json" \
   -d '{"item":"book"}'
 ```
