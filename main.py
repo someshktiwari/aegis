@@ -1,6 +1,7 @@
 # main.py
 # FastAPI application entry point.
-# Handles: app creation, lifespan (DB init + eviction task), catch-all proxy route.
+# Handles: app creation, lifespan (DB init + crash recovery + eviction task),
+# the Aegis health endpoint, and the catch-all proxy route.
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -65,26 +66,45 @@ app = FastAPI(
         "A Stripe-style idempotency proxy service. "
         "Guarantees at-most-once execution for retried HTTP requests."
     ),
-    version="1.1.1",
+    version="1.2.0",
     lifespan=lifespan,
 )
+
+
+@app.get("/_aegis/health")
+async def health():
+    """
+    Liveness check for Aegis itself.
+
+    Registered before the catch-all so it is matched first. The path is
+    namespaced under /_aegis/ precisely because Aegis proxies every other path:
+    a bare /health would shadow the upstream's own health endpoint and make it
+    unreachable through the proxy.
+
+    This deliberately does not touch the upstream. A check that forwards would
+    report 502 whenever the upstream is down, which is the opposite of what a
+    liveness probe for Aegis should say — Aegis being healthy while its
+    upstream is not is exactly the case an operator needs to distinguish.
+    """
+    return {"status": "ok", "service": "aegis", "version": app.version}
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_all(request: Request):
     """
-    Catch-all route: every incoming request passes through this handler.
+    Catch-all route: every incoming request that is not /_aegis/health passes
+    through this handler.
 
     Routing logic (in order):
+    - GET (with or without key)        → pass-through (GET is idempotent by HTTP semantics)
     - Any non-GET without X-API-Key    → 401 (authentication required)
     - Non-GET with Idempotency-Key     → idempotency path (handle_request)
     - Non-GET without Idempotency-Key  → 400 (header required)
-    - GET (with or without key)        → pass-through (GET is idempotent by HTTP semantics)
 
-    Why X-API-Key is checked first:
-    Authentication precedes all other validation. A request without a valid
-    API key should never reach idempotency logic, regardless of what other
-    headers it carries.
+    Why X-API-Key is checked before Idempotency-Key:
+    Authentication precedes all other validation. A request without an API key
+    should never reach idempotency logic, regardless of what other headers it
+    carries.
 
     Why GET is always pass-through:
     GET requests have no side effects — calling the same GET twice produces
@@ -92,6 +112,9 @@ async def proxy_all(request: Request):
     only needed for state-mutating methods (POST, PUT, PATCH, DELETE).
     A GET with an Idempotency-Key header is passed through without caching —
     applying cache semantics to a GET would serve stale data for 24h.
+    GET also bypasses the API key check: reads have no data-leak risk here,
+    and requiring the header would break every browser and health check that
+    reaches the upstream through Aegis.
 
     Header lookup uses FastAPI's Headers object for O(1) case-insensitive access
     rather than iterating all headers on every request.

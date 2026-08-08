@@ -2,6 +2,11 @@
 # All SQLite interactions. Uses aiosqlite so DB calls are non-blocking.
 # See DECISIONS.md D-003 (why SQLite) and D-010 (why async-first).
 #
+# This module owns the schema. The DDL below is the single source of truth for
+# what a row looks like; models.IdempotencyRecord is the typed shape it is read
+# back into. Column names and attribute names differ in two places (key →
+# idempotency_key, status → state) and the mapping lives in get_record().
+#
 # CRITICAL: Never import the synchronous `sqlite3` module anywhere in Aegis.
 # A blocking sqlite3 call inside an async function freezes the entire event
 # loop — all in-flight requests stall until that call completes.
@@ -47,8 +52,12 @@ async def init_db(db: aiosqlite.Connection) -> None:
 
 async def get_record(db: aiosqlite.Connection, key: str) -> Optional[IdempotencyRecord]:
     """
-    Fetch a record by idempotency key.
+    Fetch a record by scoped key ("{api_key}:{idempotency_key}").
     Returns None if the key has never been seen.
+
+    This is the one place a raw row becomes an IdempotencyRecord, so it is the
+    one place that needs to know column order. Every other module works with
+    attributes.
     """
     async with db.execute(
         """
@@ -80,11 +89,12 @@ async def get_record(db: aiosqlite.Connection, key: str) -> Optional[Idempotency
 async def insert_in_flight(db: aiosqlite.Connection, key: str, fingerprint: str) -> None:
     """
     Insert a new key in in_flight status before forwarding to upstream.
-    The lock in proxy.py is held across the entire upstream call, so
-    no concurrent request ever reads this in_flight state directly —
-    they block on the lock. in_flight exists for crash recovery: if Aegis
-    dies after this write, the next request finds the orphaned record
-    and returns 409. See DECISIONS.md D-004.
+
+    The write happens before the upstream call, not after — see D-014. The lock
+    in proxy.py is held across the entire upstream call, so during normal
+    operation no concurrent request ever reads this in_flight state directly;
+    they block on the lock. in_flight exists for crash recovery: if Aegis dies
+    after this write, the row survives and the next request finds an orphan.
 
     expires_at is set at insert time as created_at + ttl_seconds.
     """
@@ -109,7 +119,8 @@ async def update_complete(
 ) -> None:
     """
     Transition an in_flight record to completed and store the upstream response.
-    All subsequent duplicate requests will get this cached response.
+    All subsequent duplicate requests will be served this cached response until
+    the record expires.
     """
     await db.execute(
         """
@@ -134,7 +145,11 @@ async def update_failed(
 ) -> None:
     """
     Transition an in_flight record to failed and store the upstream response.
-    Client may retry with the same key — failed records are not cached.
+
+    The response is written but will never be replayed: proxy.py deletes a
+    failed record on next access and re-runs the request fresh. It is retained
+    purely so an operator inspecting the database after an incident can see
+    what the upstream actually returned before the key was retried.
     """
     await db.execute(
         """
@@ -152,11 +167,20 @@ async def update_failed(
 
 async def recover_stuck_in_flight(db: aiosqlite.Connection) -> int:
     """
-    On startup, transition any in_flight record older than 60 seconds to failed.
-    These are records where Aegis crashed mid-request and will never complete.
-    Returns number of records recovered.
+    On startup, transition any in_flight record older than
+    settings.in_flight_recovery_seconds to failed. These are records where
+    Aegis died mid-request; nothing in the new process will ever resolve them.
+    Returns the number of records recovered.
+
+    The filter is on created_at, not expires_at: recovery is about how long ago
+    the request started, not when the key expires. expires_at is 24 hours in
+    the future and would never match.
+
+    Records younger than the cutoff are left alone — they may belong to a
+    legitimate slow upstream call in a process that has not actually crashed.
+    Those still return 409 until they age out or the next restart sweeps them.
     """
-    cutoff = time.time() - 60
+    cutoff = time.time() - settings.in_flight_recovery_seconds
     cursor = await db.execute(
         """
         UPDATE idempotency_keys
@@ -171,7 +195,11 @@ async def recover_stuck_in_flight(db: aiosqlite.Connection) -> int:
 
 
 async def delete_record(db: aiosqlite.Connection, key: str) -> None:
-    """Delete a single record by key. Used when an expired record is found on access."""
+    """
+    Delete a single record by key.
+    Used when an expired or failed record is found on access, and to release
+    the key when the upstream could not be reached at all.
+    """
     await db.execute("DELETE FROM idempotency_keys WHERE key = ?", (key,))
     await db.commit()
 
